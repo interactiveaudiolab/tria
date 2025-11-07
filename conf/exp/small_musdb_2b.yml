@@ -1,0 +1,153 @@
+################################################################################
+# Training script
+################################################################################
+
+# Reproducibility
+seed: 0
+
+# Automatic mixed precision training; bound to Accelerator class
+amp: true
+
+# Checkpointing
+save_path: runs
+resume: true
+
+# Training
+num_iters: 120000
+sample_freq: 2000
+val_freq: 2000
+batch_size: 24
+val_batch_size: 10
+num_workers: 8
+save_iters: [10000, 20000, 40000, 60000, 80000, 120000, 200000]
+sample_idx: [0, 1, 2, 3, 4, 5, 6, 7]
+
+# Sample rate
+sample_rate: &sample_rate 44100
+
+# CFG dropout
+p_cfg_dropout: 0.8
+
+# Mask span width
+min_span_prop: 0.5
+max_span_prop: 0.75
+
+# Inference
+top_p: 0.85
+top_k: null
+temp: 1.0
+mask_temp: 10.5
+iterations: 8
+guidance_scale: 2.0
+causal_bias: 1.0
+
+# Tokenizer (DAC 44.1kHz)
+Tokenizer.name: dac
+
+# Rhythm features
+rhythm_features.sample_rate: 44100
+rhythm_features.n_bands: 2
+rhythm_features.n_mels: 80
+rhythm_features.window_length: 1024
+rhythm_features.hop_length: 512
+rhythm_features.quantization_levels: 33
+rhythm_features.slow_ma_ms: null
+rhythm_features.post_smooth_ms: null
+rhythm_features.legacy_normalize: true
+rhythm_features.normalize_quantile: 0.98
+rhythm_features.clamp_max: 50.0
+
+
+################################################################################
+# Model
+################################################################################
+
+# TRIA transformer stack
+TRIA.codebook_size: 1024
+TRIA.n_codebooks: 9
+TRIA.n_channels: 512
+TRIA.n_feats: 2
+TRIA.n_heads: 8
+TRIA.n_layers: 12
+TRIA.mult: 4
+TRIA.p_dropout: 0.2
+TRIA.p_token_dropout: 0.0
+TRIA.bias: true
+TRIA.max_len: 1000
+TRIA.pos_enc: rope
+TRIA.qk_norm: true
+TRIA.use_sdpa: true
+TRIA.interp: nearest
+TRIA.share_emb: true
+
+# Optimizer
+AdamW.betas: [0.9, 0.95]
+AdamW.lr: 0.0001
+AdamW.weight_decay: 0.000001
+ExponentialLR.gamma: 0.999996
+
+################################################################################
+# Data
+################################################################################
+
+# MUSDB18-HQ Corpus
+StemDataset.stems: ["drums"]
+StemDataset.sample_rate: *sample_rate
+StemDataset.duration: 6.0
+StemDataset.loudness_cutoff: -24.0
+StemDataset.num_channels: 1
+StemDataset.strict: true
+StemDataset.salience_num_tries: 8
+
+train/StemDataset.n_examples: 10000000
+train/StemDataset.sources:
+  - manifests/musdb_hq/train.csv
+  - manifests/musdb_hq/test.csv
+train/StemDataset.source_weights: [0.89, 0.11]
+train/StemDataset.with_replacement: true
+
+val/StemDataset.n_examples: 2000
+val/StemDataset.sources:
+  - manifests/musdb_hq/val.csv
+val/StemDataset.with_replacement: false
+
+################################################################################
+# Augmentations
+################################################################################
+
+tfm_prob: &tfm_prob 0.25
+
+train/build_transform.names: [
+  "BandPass",
+  "ShiftPhase",
+  "PitchShift",
+  "Equalizer",
+  "FilteredNoise",
+]
+train/build_transform.prob: 1.0
+
+val/build_transform.names: ["Identity"]
+val/build_transform.prob: 1.0
+
+VolumeNorm.prob: *tfm_prob
+VolumeNorm.db: [uniform, -40, -16]
+
+BandPass.prob: *tfm_prob
+BandPass.low_cutoff: [choice, [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]]
+BandPass.high_cutoff: [choice, [2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000]]
+BandPass.zeros: 2049
+
+ShiftPhase.prob: *tfm_prob
+
+PitchShift.prob: 1.0
+PitchShift.shift_semitones: [uniform, -6, 6]
+PitchShift.force_fast: true
+
+Equalizer.prob: *tfm_prob
+Equalizer.n_bands: 6
+Equalizer.eq_amount: [uniform, -1.0, 1.0]
+
+FilteredNoise.prob: *tfm_prob
+FilteredNoise.snr: [uniform, 10.0, 30.0]
+FilteredNoise.eq_amount: [uniform, -1.0, 1.0]
+FilteredNoise.n_bands: 6

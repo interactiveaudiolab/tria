@@ -1,0 +1,9 @@
+argbind
+descript-audiotools
+numpy
+primePy
+torch
+torchaudio
+tqdm
+tensorboard
+jupyterlab
