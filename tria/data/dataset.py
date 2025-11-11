@@ -178,6 +178,7 @@ class StemDataset(Dataset):
                     f"got {len(source_weights)}"
                 )
             w = np.asarray(source_weights, dtype=float)
+            
             # Keep only weights for sources that survived filtering
             w = w[np.array(kept_mask, dtype=bool)]
             w = np.clip(w, 0, None)
@@ -209,6 +210,11 @@ class StemDataset(Dataset):
         state = random_state((self.shuffle_state + int(idx)) & 0x7FFFFFFF)
         ridx, row = self._pick_row(state)
 
+        shortest = float(row.get("min_duration", np.inf))
+        max_off_all = max(0.0, shortest - self.duration)
+        eps = 1.0 / float(self.sample_rate)                              
+        max_valid_offset = max(0.0, max_off_all - eps) 
+
         primary = self.salience_on
         p0 = row["paths"].get(primary, "")
 
@@ -221,6 +227,7 @@ class StemDataset(Dataset):
                 except Exception:
                     total_sec = 0.0
                 max_off = max(0.0, total_sec - self.duration)
+                max_off = min(max_off, max_off_all)
                 offset = float(state.rand() * max_off) if max_off > 0 else 0.0
             else:
                 offset = rms_salience(
@@ -230,6 +237,9 @@ class StemDataset(Dataset):
                     num_tries=int(self.salience_num_tries),
                     state=state,
                 )
+                offset = min(max(0.0, offset), max_off_all)
+                
+            offset = min(offset, max_valid_offset)  
             primary_sig = load_audio(p0, offset=offset, duration=self.duration)
         else:
             offset = 0.0
@@ -240,11 +250,11 @@ class StemDataset(Dataset):
             exists = bool(p) and Path(p).is_file()
 
             if s == primary and primary_sig is not None:
-                sig = primary_sig.clone()  # reuse window we already loaded
+                sig = primary_sig.clone()  # Reuse window
             elif exists:
                 sig = load_audio(
                     p, offset=offset, duration=self.duration
-                )  # windowed load
+                )  # Windowed load
             else:
                 sig = AudioSignal.zeros(
                     self.duration, self.sample_rate, self.num_channels
@@ -257,7 +267,7 @@ class StemDataset(Dataset):
                 assert sig.num_channels == 1
                 sig.audio_data = sig.audio_data.repeat(1, self.num_channels, 1)
 
-            # Resample/pad to target SR and exact duration
+            # Resample/pad to target sample rate and exact duration
             sig = sig.resample(self.sample_rate)
             if sig.duration < self.duration:
                 sig = sig.zero_pad_to(int(self.duration * self.sample_rate))
