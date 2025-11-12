@@ -7,3 +7,4 @@ torchaudio
 tqdm
 tensorboard
 jupyterlab
+gradio
