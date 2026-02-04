@@ -1,4 +1,5 @@
 from typing import Iterable
+from typing import Optional
 from typing import Union
 
 import torch
@@ -46,6 +47,7 @@ def get_span_mask(
     min_prop: float,
     max_prop: float,
     seed: Union[int, Iterable[int]],
+    lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Mask a random span of consecutive frames across all codebooks, varying
@@ -61,6 +63,9 @@ def get_span_mask(
         Maximum proportion of frames to mask
     seed : Iterable[int]
         One or more random seeds to determine masks
+    lengths : torch.Tensor
+        Valid sequence lengths, shape (n_batch,). If provided, masked spans are
+        sampled only within valid sequence positions
 
     Returns
     -------
@@ -82,14 +87,24 @@ def get_span_mask(
         dtype=torch.bool,
     )  # (n_batch, n_frames)
 
+    if lengths is not None:
+        lengths = lengths.to(tokens.device).long().clamp_min(0).clamp_max(n_frames)
+
     for i, s in enumerate(states):
+        l = lengths[i].item() if lengths is not None else n_frames
+        if l <= 0:
+            continue  # Fully-invalid sequence, do not mask
+
         prop = s.uniform(min_prop, max_prop) if min_prop < max_prop else min_prop
 
         if prop >= 1.0:
-            mask[i] = False
+            mask[i, :l] = False
         else:
-            span = int(prop * n_frames)
-            st = s.randint(0, max(n_frames - span, 1))
+            span = int(prop * l)
+            if span <= 0:
+                continue
+
+            st = s.randint(0, max(l - span, 1))
             mask[i, st : st + span] = False
 
     return mask

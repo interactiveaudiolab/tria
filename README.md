@@ -65,6 +65,13 @@ python scripts/setup/consolidate_moises.py
 python scripts/setup/create_moises_manifests.py
 ```
 
+__Additional Drum Loops (`11G`)__: to obtain additional drum loops and improve the timbral diversity of training data, you can download the [FreeSound Loop Dataset](https://arxiv.org/abs/2008.11507). Filtering to remove short (<4s) and non-drum recordings results in a dataset of roughly 1800 loops spanning 7 hours. To download and prepare the dataset, run:
+
+```
+./scripts/download/download_loops.py.sh
+python scripts/setup/create_loops_manifests.py
+```
+
 __Large-Scale Low-Quality Drum Data__: another way to scale drum data is to run a pre-trained source separation model on a large corpus of musical mixtures such as the [MTG-Jamendo](https://mtg.github.io/mtg-jamendo-dataset/) dataset (`152G`). In our experiments, training on [HDEMUCS](https://docs.pytorch.org/audio/stable/tutorials/hybrid_demucs_tutorial.html)-separated drum stems resulted in low-quality generations due to the prevalence of separation artifacts. However, it may still be possible to leverage such noisy data data by using it to train only "early" generation steps (e.g. coarse RVQ codebooks for masked language modeling).
 
 
@@ -134,7 +141,7 @@ The training and inference code in this repository are licensed under the [MIT L
 This repository is an open-source reimplementation of the TRIA system described in [our paper](https://arxiv.org/abs/2509.15625), and as a result models trained using this repository may differ from those presented in the paper and supplementary materials. During the re-implementation process, we found that minor differences in random seeding, data augmentation, and dataset split can affect model performance in the small-data regime explored in the paper. Anecdotally, we find that __scaling training data reliably improves performance, with models exhibiting much stronger timbre adherence and reduced sensitivity to inference parameter configurations__. 
 
 Therefore:
-* If you want a TRIA model trained on licensed, publicly available data (i.e. both MusDB and MoisesDB), we recommend using the [default configuration](conf/small_musdb_moises_2b.yml)
+* If you want a TRIA model trained on licensed, publicly available data (i.e. MusDB, MoisesDB, and FreeSound Loops), we recommend using the [default configuration](conf/small_musdb_moises_fsl_2b.yml)
 * If you want to explore the settings discussed in the TRIA paper, we provide [matching configurations](conf/exp/)
 * If you have access to large-scale high-quality licensed drum data, we recommend re-training TRIA on that data. 
 

@@ -55,6 +55,16 @@ def collate(list_of_dicts: list, n_splits: int = None):
     splitting a batch into multiple sub-batches for the purposes of gradient
     accumulation, etc. Adapted from `audiotools.core.util.collate`.
 
+    Cases are as follows:
+      * AudioSignal objects, which wrap tensors of shape (b, c, t), are padded
+        to t_max and batched
+      * 3+ dimensional tensors of shape (b, ..., c, t) are padded to t_max and
+        batched
+      * 2 dimensional tensors of shape (b, c) are batched without padding,
+        assuming a matching channel dimension
+      * 1 dimensional tensors of shape (b,) are batched
+      * Remaining data types are handled via `default_collate`
+
     Parameters
     ----------
     list_of_dicts : list
@@ -87,9 +97,48 @@ def collate(list_of_dicts: list, n_splits: int = None):
             if not isinstance(v, list):
                 continue
 
+            # Determine valid lengths key, extracting name from flattened (tuple) key
+            k_lengths = k[:-1] + (f"{k[-1]}_lengths",)
+            example = v[0]
+
             # AudioSignal → pad & batch
             if all(isinstance(s, AudioSignal) for s in v):
+                lengths = torch.tensor(
+                    [s.signal_length for s in v],
+                    dtype=torch.long,
+                )  # (n_batch,)
+
+                # Batch signals
                 batch[k] = AudioSignal.batch(v, pad_signals=True)
+                batch[k_lengths] = lengths
+
+            # Tensor → (possibly) pad & batch
+            elif all(isinstance(s, torch.Tensor) for s in v):
+                # Assume matching number of dimensions across batch
+                ndim = example.ndim
+
+                # Assume (b, ..., c, t)
+                if ndim >= 3:
+                    lengths = torch.tensor(
+                        [s.shape[-1] for s in v], dtype=torch.long
+                    )  # (n_batch,)
+
+                    # Stack along first dimension
+                    tgt_shape = (len(v), *example.shape[1:-1], lengths.amax().item())
+
+                    # Pad to max length
+                    batch[k] = torch.zeros(tgt_shape, dtype=example.dtype)
+                    for i in range(len(v)):
+                        batch[k][i, ..., : lengths[i]] = v[i]
+                    batch[k_lengths] = lengths
+
+                # Assume (b,) or (b, c)
+                elif ndim in [1, 2]:
+                    batch[k] = torch.stack(v, dim=0)
+
+                # Fall back to default
+                else:
+                    batch[k] = torch.utils.data._utils.collate.default_collate(v)
 
             # Strings / Paths → keep as list
             elif all(isinstance(s, (str, Path)) for s in v):
@@ -103,6 +152,7 @@ def collate(list_of_dicts: list, n_splits: int = None):
                 # Fallback to torch default collate (tensors, numbers, mappings, etc.)
                 try:
                     batch[k] = torch.utils.data._utils.collate.default_collate(v)
+
                 except TypeError:
                     # Last-resort: keep raw list
                     batch[k] = v
@@ -130,6 +180,8 @@ def load_audio(
     """
     if file_sample_rate is None:
         _duration, sample_rate = get_info(path)
+    else:
+        sample_rate = file_sample_rate
     start = int(offset * sample_rate)
     n_samples = int(duration * sample_rate)
 

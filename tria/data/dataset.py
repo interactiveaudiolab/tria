@@ -144,8 +144,6 @@ class StemDataset(Dataset):
                                 break
                 if not any_valid or not np.isfinite(min_dur):
                     continue
-                if min_dur < self.duration and self.strict:
-                    continue
 
                 r["min_duration"] = min_dur if np.isfinite(min_dur) else 0.0
                 filtered.append(r)
@@ -178,7 +176,7 @@ class StemDataset(Dataset):
                     f"got {len(source_weights)}"
                 )
             w = np.asarray(source_weights, dtype=float)
-            
+
             # Keep only weights for sources that survived filtering
             w = w[np.array(kept_mask, dtype=bool)]
             w = np.clip(w, 0, None)
@@ -212,8 +210,8 @@ class StemDataset(Dataset):
 
         shortest = float(row.get("min_duration", np.inf))
         max_off_all = max(0.0, shortest - self.duration)
-        eps = 1.0 / float(self.sample_rate)                              
-        max_valid_offset = max(0.0, max_off_all - eps) 
+        eps = 1.0 / float(self.sample_rate)
+        max_valid_offset = max(0.0, max_off_all - eps)
 
         primary = self.salience_on
         p0 = row["paths"].get(primary, "")
@@ -238,8 +236,8 @@ class StemDataset(Dataset):
                     state=state,
                 )
                 offset = min(max(0.0, offset), max_off_all)
-                
-            offset = min(offset, max_valid_offset)  
+
+            offset = min(offset, max_valid_offset)
             primary_sig = load_audio(p0, offset=offset, duration=self.duration)
         else:
             offset = 0.0
@@ -269,8 +267,11 @@ class StemDataset(Dataset):
 
             # Resample/pad to target sample rate and exact duration
             sig = sig.resample(self.sample_rate)
-            if sig.duration < self.duration:
-                sig = sig.zero_pad_to(int(self.duration * self.sample_rate))
+
+            # DEBUG: do not enforce duration in dataset, but instead handle
+            # padding during collation
+            # if sig.duration < self.duration:
+            #    sig = sig.zero_pad_to(int(self.duration * self.sample_rate))
 
             # Metadata
             sig.metadata["path"] = p
