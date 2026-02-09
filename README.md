@@ -9,7 +9,7 @@ This repository contains training and inference code for the TRIA "anything-to-d
 ![](https://static.arxiv.org/static/browse/0.3.4/images/icons/favicon-16x16.png) [arXiv Paper: The Rhythm In Anything: Audio-Prompted Drums Generation with Masked Language Modeling
 ](https://arxiv.org/abs/2509.15625) <br>
 📈 [Demo Site](https://therhythminanything.github.io)<br>
-⚙ [Model Weights](https://github.com/interactiveaudiolab/tria/releases/download/0.0.1/weights.pth)
+⚙ [Model Weights](pretrained/tria/)
 
 ## Installation
 
@@ -130,6 +130,12 @@ export CUDA_VISIBLE_DEVICES=0,1
 torchrun --nproc_per_node gpu scripts/train.py --args.load conf/small_2b_musdb.yml
 ```
 
+### Distillation
+
+We provide a [script](scripts/distill.py) (and corresponding [example configuration file](conf/distill_tiny_musdb_moises_fsl_2b.yml)) to distill TRIA into a smaller model:
+```
+torchrun --nproc_per_node gpu scripts/distill.py --args.load conf/distill_tiny_musdb_moises_fsl_2b.yml
+```
 
 ## Licenses
 

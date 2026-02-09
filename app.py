@@ -48,7 +48,7 @@ LOADED = dict(
 MODEL_ZOO = {
 
     "small_musdb_moises_fsl_2b": {
-        "checkpoint": "pretrained/tria/small_musdb_moises_fsl_2b/80000/model.pt",
+        "checkpoint": "pretrained/tria/small_musdb_moises_fsl_2b/latest/model.pt",
         "model_cfg": {
             "codebook_size": 1024,
             "n_codebooks": 9,
@@ -93,7 +93,7 @@ MODEL_ZOO = {
     },
 
     "small_musdb_moises_2b": {
-        "checkpoint": "pretrained/tria/small_musdb_moises_2b/80000/model.pt",
+        "checkpoint": "pretrained/tria/small_musdb_moises_2b/latest/model.pt",
         "model_cfg": {
             "codebook_size": 1024,
             "n_codebooks": 9,
@@ -101,6 +101,51 @@ MODEL_ZOO = {
             "n_feats": 2,
             "n_heads": 8,
             "n_layers": 12,
+            "mult": 4,
+            "p_dropout": 0.0,
+            "bias": True,
+            "max_len": 1000,
+            "pos_enc": "rope",
+            "qk_norm": True,
+            "use_sdpa": True,
+            "interp": "nearest",
+            "share_emb": True,
+        },
+        "tokenizer_cfg": {"name": "dac"},
+        "feature_cfg": {
+            "sample_rate": 16_000,
+            "n_bands": 2,
+            "n_mels": 40,
+            "window_length": 384,
+            "hop_length": 192,
+            "quantization_levels": 5,
+            "slow_ma_ms": 200,
+            "post_smooth_ms": 100,
+            "legacy_normalize": False,
+            "clamp_max": 50.0,
+            "normalize_quantile": 0.98,
+        },
+        "infer_cfg": {
+            "top_p": 0.95,
+            "top_k": None,
+            "temp": 1.0,
+            "mask_temp": 10.5,
+            "iterations": [8, 8, 8, 8, 4, 4, 4, 4, 4],
+            "guidance_scale": 2.0,
+            "causal_bias": 1.0,
+        },
+        "max_duration": 6.0,
+    },
+
+    "tiny_musdb_moises_fsl_2b": {
+        "checkpoint": "pretrained/tria/distilled_tiny_musdb_moises_fsl_2b/latest/model.pt",
+        "model_cfg": {
+            "codebook_size": 1024,
+            "n_codebooks": 9,
+            "n_channels": 384,
+            "n_feats": 2,
+            "n_heads": 6,
+            "n_layers": 6,
             "mult": 4,
             "p_dropout": 0.0,
             "bias": True,
