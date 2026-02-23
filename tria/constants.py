@@ -9,3 +9,4 @@ ASSETS_DIR = Path(__file__).parent.parent / "assets"
 STEMS = ["drums", "bass", "vocals", "other", "mixture"]
 SAMPLE_RATE = 44_100
 DURATION = 6.0
+EPS = 1e-8

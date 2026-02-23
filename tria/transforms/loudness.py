@@ -11,17 +11,20 @@ from audiotools import STFTParams
 from audiotools.core.util import ensure_tensor
 from audiotools.core.util import random_state
 from audiotools.core.util import sample_from_dist
-from audiotools.data.transforms import BaseTransform
 from numpy.random import RandomState
+
+from .base import NormalizedBaseTransform
 
 ################################################################################
 # Normalization transform for encouraging robust rhythm feature extraction
 ################################################################################
 
 
-class VolumeNorm(BaseTransform):
+class VolumeNorm(NormalizedBaseTransform):
     """
-    Normalize to a target RMS level (in dBFS).
+    Normalize to a target RMS level (in dBFS). Note that unlike other 
+    transforms, VolumeNorm does not support `match_energy` on outputs as its
+    intended purpose is to modify loudness
     """
 
     def __init__(
@@ -30,8 +33,18 @@ class VolumeNorm(BaseTransform):
         name: Optional[str] = None,
         prob: float = 1.0,
         eps: float = 1e-12,
+        # Normalization
+        match_energy: bool = False,
+        clamp_gain: Optional[float] = None,
+        ensure_max_of_audio: bool = True,
     ):
-        super().__init__(name=name, prob=prob)
+        super().__init__(
+            name=name, 
+            prob=prob,
+            match_energy=False, 
+            clamp_gain=clamp_gain, 
+            ensure_max_of_audio=ensure_max_of_audio,
+        )
         self.db = db
         self.eps = float(eps)
 

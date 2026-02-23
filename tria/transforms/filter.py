@@ -1,21 +1,97 @@
 import copy
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 from audiotools import AudioSignal
 from audiotools import STFTParams
 from audiotools.core.util import random_state
 from audiotools.core.util import sample_from_dist
-from audiotools.data.transforms import BaseTransform
 from numpy.random import RandomState
+
+from ..dsp import high_pass, low_pass
+from .base import NormalizedBaseTransform
 
 ################################################################################
 # Bandpass transform for encouraging robust rhythm feature extraction
 ################################################################################
 
 
-class BandPass(BaseTransform):
+class LowPass(NormalizedBaseTransform):
+    def __init__(
+        self,
+        cutoff: tuple = ("choice", [4000, 8000, 16000]),
+        zeros: int = 51,
+        quantize_hz: float = 1.0,
+        name: str = None,
+        prob: float = 1.0,
+        # Normalization
+        match_energy: bool = True,
+        clamp_gain: Optional[float] = None,
+        ensure_max_of_audio: bool = True,
+    ):
+        super().__init__(
+            name=name, 
+            prob=prob,
+            match_energy=match_energy, 
+            clamp_gain=clamp_gain, 
+            ensure_max_of_audio=ensure_max_of_audio,
+        )
+        self.cutoff = cutoff
+        self.zeros = int(zeros)
+        self.quantize_hz = float(quantize_hz)
+
+    def _instantiate(self, state: RandomState):
+        return {"cutoff": sample_from_dist(self.cutoff, state)}
+
+    def _transform(self, signal, cutoff):
+        return low_pass(
+            signal,
+            cutoff,
+            zeros=self.zeros,
+            quantize_hz=self.quantize_hz,
+            inplace=True,
+        )
+
+
+class HighPass(NormalizedBaseTransform):
+    def __init__(
+        self,
+        cutoff: tuple = ("choice", [50, 100, 250, 500, 1000]),
+        zeros: int = 51,
+        quantize_hz: float = 1.0,
+        name: str = None,
+        prob: float = 1.0,
+        # Normalization
+        match_energy: bool = True,
+        clamp_gain: Optional[float] = None,
+        ensure_max_of_audio: bool = True,
+    ):
+        super().__init__(
+            name=name, 
+            prob=prob,
+            match_energy=match_energy, 
+            clamp_gain=clamp_gain, 
+            ensure_max_of_audio=ensure_max_of_audio,
+        )
+        self.cutoff = cutoff
+        self.zeros = int(zeros)
+        self.quantize_hz = float(quantize_hz)
+
+    def _instantiate(self, state: RandomState):
+        return {"cutoff": sample_from_dist(self.cutoff, state)}
+
+    def _transform(self, signal, cutoff):
+        return high_pass(
+            signal,
+            cutoff,
+            zeros=self.zeros,
+            quantize_hz=self.quantize_hz,
+            inplace=True,
+        )
+
+
+class BandPass(NormalizedBaseTransform):
     """
     Band pass filter.
     """
@@ -25,13 +101,25 @@ class BandPass(BaseTransform):
         low_cutoff: tuple = ("choice", [50, 100, 250, 500]),
         high_cutoff: tuple = ("choice", [1000, 2000, 4000, 8000]),
         zeros: int = 51,
+        quantize_hz: float = 1.0,
         name: str = None,
         prob: float = 1.0,
+        # Normalization
+        match_energy: bool = True,
+        clamp_gain: Optional[float] = None,
+        ensure_max_of_audio: bool = True,
     ):
-        super().__init__(name=name, prob=prob)
+        super().__init__(
+            name=name, 
+            prob=prob,
+            match_energy=match_energy, 
+            clamp_gain=clamp_gain, 
+            ensure_max_of_audio=ensure_max_of_audio,
+        )
         self.low_cutoff = low_cutoff
         self.high_cutoff = high_cutoff
         self.zeros = zeros
+        self.quantize_hz = float(quantize_hz)
 
         # Validate cutoffs, fail if overlap
         lo_min, lo_max = self._dist_min_max(self.low_cutoff)
@@ -91,13 +179,25 @@ class BandPass(BaseTransform):
         return {"low_cutoff": float(lo), "high_cutoff": float(hi)}
 
     def _transform(self, signal, low_cutoff, high_cutoff):
-        sig = signal.high_pass(low_cutoff, zeros=self.zeros)
-        sig = sig.low_pass(high_cutoff, zeros=self.zeros)
+        sig = high_pass(
+            signal, 
+            low_cutoff, 
+            zeros=self.zeros, 
+            quantize_hz=self.quantize_hz, 
+            inplace=True
+        )
+        sig = low_pass(
+            sig, 
+            high_cutoff, 
+            zeros=self.zeros,
+            quantize_hz=self.quantize_hz, 
+            inplace=True
+        )
         sig = sig.ensure_max_of_audio()
         return sig
 
 
-class Equalizer(BaseTransform):
+class Equalizer(NormalizedBaseTransform):
     """
     Mel-band equalization.
     """
@@ -108,8 +208,18 @@ class Equalizer(BaseTransform):
         n_bands: int = 6,
         name: str = None,
         prob: float = 1.0,
+        # Normalization
+        match_energy: bool = True,
+        clamp_gain: Optional[float] = None,
+        ensure_max_of_audio: bool = True,
     ):
-        super().__init__(name=name, prob=prob)
+        super().__init__(
+            name=name, 
+            prob=prob,
+            match_energy=match_energy, 
+            clamp_gain=clamp_gain, 
+            ensure_max_of_audio=ensure_max_of_audio,
+        )
 
         self.eq_amount = eq_amount
         self.n_bands = n_bands

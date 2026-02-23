@@ -1,6 +1,7 @@
 import torch
 from audiotools import AudioSignal
 
+from .dsp import resample
 
 ################################################################################
 # Utilities for extracting rhythm feature representations
@@ -95,7 +96,7 @@ def rhythm_features(
     assert quantization_levels >= 2
 
     # Loudness normalization
-    signal = signal.clone().to_mono().resample(sample_rate).normalize(-16.)
+    signal = resample(signal.clone().to_mono(), sample_rate).normalize(-16.)
     signal.ensure_max_of_audio()
 
     # Clamped mel spectrogram

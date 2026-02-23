@@ -5,6 +5,7 @@ import torch
 from audiotools import AudioSignal
 
 from ...constants import PRETRAINED_DIR
+from ...dsp import resample
 from .dac import DAC
 
 ################################################################################
@@ -146,7 +147,8 @@ class Tokenizer(torch.nn.Module):
             )
 
         # Wrap into AudioSignal and resample to tokenizer sample rate
-        preprocessed = AudioSignal(x, sample_rate=orig_sample_rate).resample(
+        preprocessed = resample(
+            AudioSignal(x, sample_rate=orig_sample_rate),
             self.sample_rate
         )
 
@@ -210,7 +212,7 @@ class Tokenizer(torch.nn.Module):
         )
         assert out.num_channels == self.n_channels
 
-        out = out.resample(orig_sample_rate)
+        out = resample(out, orig_sample_rate)
 
         if self.n_channels < orig_n_channels:
             # Mono codec, multichannel audio

@@ -35,6 +35,7 @@ class TRIA(torch.nn.Module):
         use_sdpa: bool = True,
         interp: str = "nearest",
         share_emb: bool = True,
+        n_registers: int = None,
     ):
         super().__init__()
 
@@ -56,6 +57,13 @@ class TRIA(torch.nn.Module):
             use_sdpa=use_sdpa,
         )
 
+        self.n_registers = n_registers or 0
+        if self.n_registers:
+            self.registers = torch.nn.Parameter(
+                torch.randn(n_codebooks, self.n_registers, n_channels))
+        else:
+            self.registers = None
+        
         self.tokens_emb = torch.nn.Embedding(codebook_size * n_codebooks, n_channels)
         self.head = torch.nn.Linear(
             n_channels, codebook_size * n_codebooks, bias=False
@@ -185,9 +193,23 @@ class TRIA(torch.nn.Module):
         )  # (n_batch, n_frames, 2 * n_channels)
         x = self.in_proj(x)  # (n_batch, n_frames, n_channels)
 
+        # Optionally prepend learnable codebook-specific registers
+        if self.n_registers:
+            codebook_mask = torch.arange(n_codebooks, device=device)[None, :] == codebook[:, None]  # (n_batch, n_codebooks)
+
+            registers = self.registers[None, ...] * codebook_mask[:, :, None, None]
+            registers = registers.sum(1)  # (n_batch, n_registers, n_channels)
+
+            x = torch.cat([registers, x], dim=1)  # (n_batch, n_frames', n_channels)
+            lengths = lengths + self.n_registers
+        
         # Process with transformer
         x = self.backbone(x=x, lengths_x=lengths)  # (n_batch, n_frames, n_channels)
 
+        # Trim registers
+        if self.n_registers:
+            x = x[:, self.n_registers:, :]
+        
         # Predict token logits
         logits = self.head(x)  # (n_batch, n_frames, n_codebooks * codebook_size)
         logits = logits.reshape(
