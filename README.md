@@ -2,7 +2,7 @@
   <img src="assets/img/tria_logo.svg" alt="TRIA logo" style="width: 50%;">
 </div>
 
-# The Rhythm In Anything: Audio-Prompted Drums Generation with Masked Language Modeling 
+# The Rhythm In Anything: Audio-Prompted Drums Generation with Masked Language Modeling
 
 This repository contains training and inference code for the TRIA "anything-to-drums" system proposed in the paper **The Rhythm In Anything: Audio-Prompted Drums Generation with Masked Language Modeling**.
 
@@ -78,7 +78,7 @@ __Large-Scale Low-Quality Drum Data__: another way to scale drum data is to run 
 ### Configuration
 
 
-We provide configuration files for the five TRIA variants evaluated in our paper in the `conf/` directory, with `small_2b_musdb.yml` corresponding to the "main" TRIA system.
+We provide configuration files for the five TRIA variants evaluated in our paper in the `conf/paper_exp/` directory, with `small_musdb_2b.yml` corresponding to the "main" TRIA system evaluated in the paper.
 
 We use [`argbind`](https://github.com/pseeth/argbind) for training configuration. Once you've downloaded data and created manifests, training/validation datasets can be modified by providing paths in the relevant portions of the config file:
 
@@ -95,14 +95,14 @@ as can noise and impulse response sources for data augmentation:
 ```
 train/build_transform.names: [
   ...
-  "Reverb",
+  "RoomImpulseResponse",
   "BackgroundNoise",
 ]
 
 ...
 
-Reverb.drr: [uniform, 0.0, 30.0]
-Reverb.sources:
+RoomImpulseResponse.drr: [uniform, 0.0, 30.0]
+RoomImpulseResponse.sources:
   - manifests/rir_real/train.csv
 
 BackgroundNoise.snr: [uniform, 10.0, 30.0]
@@ -118,7 +118,7 @@ One you have downloaded your chosen datasets, you can train on a single GPU with
 
 ```
 export CUDA_VISIBLE_DEVICES=0
-python scripts/train.py --args.load conf/small_2b_musdb.yml
+python scripts/train.py --args.load conf/small_musdb_moises_fsl_2b.yml
 ```
 
 ### Multi-GPU Training
@@ -127,36 +127,35 @@ You can train on multiple GPUs (e.g. 2) with:
 
 ```
 export CUDA_VISIBLE_DEVICES=0,1
-torchrun --nproc_per_node gpu scripts/train.py --args.load conf/small_2b_musdb.yml
+torchrun --nproc_per_node gpu scripts/train.py --args.load conf/small_musdb_moises_fsl_2b.yml
 ```
 
 ### Distillation
 
-We provide a [script](scripts/distill.py) (and corresponding [example configuration file](conf/distill_tiny_musdb_moises_fsl_2b.yml)) to distill TRIA into a smaller model:
+We provide a [script](scripts/distill.py) (and corresponding [example configuration file](conf/distill/distill_tiny_musdb_moises_fsl_2b.yml)) to distill TRIA into a smaller model:
 ```
 torchrun --nproc_per_node gpu scripts/distill.py --args.load conf/distill_tiny_musdb_moises_fsl_2b.yml
 ```
 
 ## Licenses
 
-The training and inference code in this repository are licensed under the [MIT License](LICENSE). The pretrained model weights are obtained from data licensed under [Creative Commons Attribution-NonCommercial-ShareAlike (CC BY-NC-SA)](https://creativecommons.org/licenses/by-nc-sa/4.0/) and are therefore released under the same license.
+The training and inference code in this repository are licensed under the [MIT License](LICENSE) with the exception of the transforms in `tria/transforms/dasp/` adapted from [DASP-PyTorch](https://github.com/csteinmetz1/dasp-pytorch); this module is licensed under the original [Apache 2.0 license](tria/transforms/dasp/LICENSE), was not used for experiments presented in the paper, and can be easily removed. The pretrained model weights are obtained from data licensed under [Creative Commons Attribution-NonCommercial-ShareAlike (CC BY-NC-SA)](https://creativecommons.org/licenses/by-nc-sa/4.0/) and are therefore released under the same license.
 
 
 ## Model Versions
 
-This repository is an open-source reimplementation of the TRIA system described in [our paper](https://arxiv.org/abs/2509.15625), and as a result models trained using this repository may differ from those presented in the paper and supplementary materials. During the re-implementation process, we found that minor differences in random seeding, data augmentation, and dataset split can affect model performance in the small-data regime explored in the paper. Anecdotally, we find that __scaling training data reliably improves performance, with models exhibiting much stronger timbre adherence and reduced sensitivity to inference parameter configurations__. 
+This repository is an open-source reimplementation of the TRIA system described in [our paper](https://arxiv.org/abs/2509.15625), and as a result models trained using this repository may differ from those presented in the paper and supplementary materials. During the re-implementation process, we found that minor differences in random seeding, data augmentation, and dataset split can affect model performance in the small-data regime explored in the paper. Anecdotally, we find that __scaling training data reliably improves performance, with models exhibiting much stronger timbre adherence and reduced sensitivity to inference parameter configurations__.
 
 Therefore:
-* If you want a TRIA model trained on licensed, publicly available data (i.e. MusDB, MoisesDB, and FreeSound Loops), we recommend using the [default configuration](conf/small_musdb_moises_fsl_2b.yml)
-* If you want to explore the settings discussed in the TRIA paper, we provide [matching configurations](conf/exp/)
-* If you have access to large-scale high-quality licensed drum data, we recommend re-training TRIA on that data. 
+* If you want a TRIA model trained on licensed, publicly available data (i.e. MusDB, MoisesDB, and FreeSound Loops), we recommend using the [default configuration](conf/small_musdb_moises_fsl_2b.yml).
+* If you want to explore the settings discussed in the TRIA paper, we provide [matching configurations](conf/paper_exp/).
+* If you have access to large-scale high-quality licensed drum data, we recommend re-training TRIA on that data.
 
 
 ## 📝 To-Do:
-* Add configs/weights for ablations and offload weights from repo
-* Both the `Reverb` and `BackgroundNoise` transforms are slow due to inefficient file reads and salient excerpting
+* Add remaining configs/weights for ablations and offload weights from repo
 * Add support for additional discrete and continuous tokenizers; currently, only [DAC](https://github.com/descriptinc/descript-audio-codec) is supported, as the code and weights are MIT-licensed
-* Switch rhythm features from perceptual to RMS loudness normalization to match original TRIA
+* Switch rhythm features from perceptual loudness to energy normalization to match original TRIA
 * Allow training on variable feature sparsity / quantization, akin to [Sketch2Sound](https://arxiv.org/abs/2412.08550), to allow for inference-time control over conditioning granularity
 * Additional learning rate schedules (currently using DAC exponential decay schedule)
 
