@@ -2,8 +2,6 @@
 Adapted from `torch_pitch_shift` by Kento Nishi (MIT license); see:
 https://github.com/KentoNishi/torch-pitch-shift/
 """
-from __future__ import annotations
-
 from collections import Counter, OrderedDict
 from fractions import Fraction
 from functools import lru_cache

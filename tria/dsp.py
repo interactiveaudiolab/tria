@@ -1,7 +1,7 @@
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Dict, Generic, Optional, TypeVar, Union
 
 import numpy as np
 import torch
@@ -13,6 +13,8 @@ from audiotools.core.util import ensure_tensor, sample_from_dist
 # Signal processing utilities for filters, etc.
 ################################################################################
 
+K = TypeVar("K")  # Hashable key type for caching
+
 
 @dataclass(frozen=True)
 class FilterKey:
@@ -20,7 +22,7 @@ class FilterKey:
     Cache low/high-pass kernels to avoid re-initialization and device movement
     """
     kind: str              # "lp" or "hp"
-    cutoff_norm_q: float   # normalized cutoff (Hz / sr), quantized
+    cutoff_norm_q: float   # Normalized cutoff (Hz / sr), quantized
     zeros: int
     device: str
     dtype: torch.dtype
@@ -37,33 +39,34 @@ class ResampleKey:
     rolloff: float
     device: str
     dtype: torch.dtype
+    
 
-
-class FilterCache:
+class _PerDeviceModuleCache(Generic[K]):
     """
-    Cache julius.{LowPassFilter,HighPassFilter} modules with memory-based eviction.
+    Base class for caching kernels keyed by K, with per-device LRU and automatic
+    eviction when memory budget is exceeded.
 
-    - Per-process (DDP-safe by construction)
-    - Per-device budgets (e.g. "cuda:0", "cuda:1", "cpu")
-    - LRU eviction within each device when over budget
+    Subclasses implement:
+      - _make_module(key, *, device, dtype) -> torch.nn.Module
     """
 
     def __init__(
         self,
         max_bytes_per_device: Optional[Dict[str, int]] = None,
-        default_max_bytes: int = 256 * 1024 * 1024,  # 256MB
+        default_max_bytes: int = 256 * 1024 * 1024,
     ):
         self.default_max_bytes = int(default_max_bytes)
         self.max_bytes_per_device = dict(max_bytes_per_device or {})
 
-        self._cache: Dict[str, "OrderedDict[FilterKey, torch.nn.Module]"] = {}
+        self._cache: Dict[str, OrderedDict[K, torch.nn.Module]] = {}
         self._bytes: Dict[str, int] = {}
 
     def set_max_bytes(self, device: str, max_bytes: int):
         self.max_bytes_per_device[str(device)] = int(max_bytes)
 
     def get_max_bytes(self, device: str) -> int:
-        return int(self.max_bytes_per_device.get(str(device), self.default_max_bytes))
+        return int(
+            self.max_bytes_per_device.get(str(device), self.default_max_bytes))
 
     def clear(self, device: Optional[str] = None):
         if device is None:
@@ -76,15 +79,14 @@ class FilterCache:
 
     @staticmethod
     def _module_bytes(m: torch.nn.Module) -> int:
-        kb = 0
+        n = 0
         for _, buf in m.named_buffers(recurse=True):
-            kb += buf.numel() * buf.element_size()
+            n += buf.numel() * buf.element_size()
         for _, p in m.named_parameters(recurse=True):
-            kb += p.numel() * p.element_size()
-        return int(kb)
+            n += p.numel() * p.element_size()
+        return int(n)
 
-    def _evict_if_needed(self, device: str):
-        d = str(device)
+    def _evict_if_needed(self, d: str):
         budget = self.get_max_bytes(d)
         if budget <= 0:
             self.clear(d)
@@ -96,9 +98,45 @@ class FilterCache:
 
         cur = int(self._bytes.get(d, 0))
         while cache_d and cur > budget:
-            _, m = cache_d.popitem(last=False)
+            _, m = cache_d.popitem(last=False)  # LRU eviction
             cur -= self._module_bytes(m)
         self._bytes[d] = max(0, cur)
+
+    def get(self, key: K, *, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+        d = str(device)
+
+        # Caching disabled for this device: construct + return without tracking
+        if self.get_max_bytes(d) <= 0:
+            return self._make_module(key, device=device, dtype=dtype)
+
+        cache_d = self._cache.setdefault(d, OrderedDict())
+        m = cache_d.get(key)
+        if m is not None:
+            cache_d.move_to_end(key)
+            return m
+
+        m = self._make_module(key, device=device, dtype=dtype)
+
+        cache_d[key] = m
+        cache_d.move_to_end(key)
+
+        self._bytes[d] = int(self._bytes.get(d, 0)) + self._module_bytes(m)
+        self._evict_if_needed(d)
+        return m
+
+    def _make_module(self, key: K, *, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+        raise NotImplementedError
+
+
+class FilterCache(_PerDeviceModuleCache[FilterKey]):
+    def __init__(
+        self,
+        max_bytes_per_device: Optional[Dict[str, int]] = None,
+        default_max_bytes: int = 256 * 1024 * 1024,
+    ):
+        super().__init__(
+            max_bytes_per_device=max_bytes_per_device, 
+            default_max_bytes=default_max_bytes)
 
     def get(
         self,
@@ -114,13 +152,6 @@ class FilterCache:
             raise ValueError(f"kind must be 'lp' or 'hp', got {kind}")
 
         d = str(device)
-        if self.get_max_bytes(d) <= 0:
-            # caching disabled
-            if kind == "lp":
-                return julius.LowPassFilter(float(cutoff_norm_q), zeros=int(zeros)).to(device=device, dtype=dtype)
-            else:
-                return julius.HighPassFilter(float(cutoff_norm_q), zeros=int(zeros)).to(device=device, dtype=dtype)
-
         key = FilterKey(
             kind=kind,
             cutoff_norm_q=float(cutoff_norm_q),
@@ -128,88 +159,25 @@ class FilterCache:
             device=d,
             dtype=dtype,
         )
+        return super().get(key, device=device, dtype=dtype)
 
-        cache_d = self._cache.setdefault(d, OrderedDict())
-        m = cache_d.get(key)
-        if m is not None:
-            cache_d.move_to_end(key)
-            return m
-
-        if kind == "lp":
-            m = julius.LowPassFilter(float(cutoff_norm_q), zeros=int(zeros)).to(device=device, dtype=dtype)
+    def _make_module(self, key: FilterKey, *, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+        if key.kind == "lp":
+            m = julius.LowPassFilter(float(key.cutoff_norm_q), zeros=int(key.zeros))
         else:
-            m = julius.HighPassFilter(float(cutoff_norm_q), zeros=int(zeros)).to(device=device, dtype=dtype)
-
-        cache_d[key] = m
-        cache_d.move_to_end(key)
-
-        self._bytes[d] = int(self._bytes.get(d, 0)) + self._module_bytes(m)
-        self._evict_if_needed(d)
-
-        return m
+            m = julius.HighPassFilter(float(key.cutoff_norm_q), zeros=int(key.zeros))
+        return m.to(device=device, dtype=dtype)
 
 
-class ResampleCache:
-    """
-    Cache julius.ResampleFrac modules with memory-based eviction.
-
-    - Per-process (DDP-safe by construction: each rank is its own process)
-    - Separate LRU per device string (e.g. "cuda:0", "cpu")
-    - Memory-based eviction within each device
-    """
-
+class ResampleCache(_PerDeviceModuleCache[ResampleKey]):
     def __init__(
         self,
         max_bytes_per_device: Optional[Dict[str, int]] = None,
-        default_max_bytes: int = 512 * 1024 * 1024,  # 512MB
+        default_max_bytes: int = 512 * 1024 * 1024,
     ):
-        self.default_max_bytes = int(default_max_bytes)
-        self.max_bytes_per_device = dict(max_bytes_per_device or {})
-
-        self._cache: Dict[str, "OrderedDict[ResampleKey, torch.nn.Module]"] = {}
-        self._bytes: Dict[str, int] = {}
-
-    def set_max_bytes(self, device: str, max_bytes: int):
-        self.max_bytes_per_device[str(device)] = int(max_bytes)
-
-    def get_max_bytes(self, device: str) -> int:
-        return int(self.max_bytes_per_device.get(str(device), self.default_max_bytes))
-
-    def clear(self, device: Optional[str] = None):
-        if device is None:
-            self._cache.clear()
-            self._bytes.clear()
-            return
-        d = str(device)
-        self._cache.pop(d, None)
-        self._bytes.pop(d, None)
-
-    @staticmethod
-    def _module_bytes(m: torch.nn.Module) -> int:
-        kb = 0
-        for _, buf in m.named_buffers(recurse=True):
-            kb += buf.numel() * buf.element_size()
-        for _, p in m.named_parameters(recurse=True):
-            kb += p.numel() * p.element_size()
-        return int(kb)
-
-    def _evict_if_needed(self, device: str):
-        d = str(device)
-        budget = self.get_max_bytes(d)
-        if budget <= 0:
-            # budget 0 means "don't cache"
-            self.clear(d)
-            return
-
-        cache_d = self._cache.get(d)
-        if not cache_d:
-            return
-
-        cur = int(self._bytes.get(d, 0))
-        while cache_d and cur > budget:
-            _, m = cache_d.popitem(last=False)
-            cur -= self._module_bytes(m)
-        self._bytes[d] = max(0, cur)
+        super().__init__(
+            max_bytes_per_device=max_bytes_per_device, 
+            default_max_bytes=default_max_bytes)
 
     def get(
         self,
@@ -224,12 +192,6 @@ class ResampleCache:
         old_sr = int(old_sr)
         new_sr = int(new_sr)
         d = str(device)
-
-        if self.get_max_bytes(d) <= 0:
-            return julius.ResampleFrac(old_sr, new_sr, int(zeros), float(rolloff)).to(
-                device=device, dtype=dtype
-            )
-
         key = ResampleKey(
             old_sr=old_sr,
             new_sr=new_sr,
@@ -238,25 +200,12 @@ class ResampleCache:
             device=d,
             dtype=dtype,
         )
+        return super().get(key, device=device, dtype=dtype)
 
-        cache_d = self._cache.setdefault(d, OrderedDict())
-        m = cache_d.get(key)
-        if m is not None:
-            cache_d.move_to_end(key)
-            return m
-
-        m = julius.ResampleFrac(old_sr, new_sr, int(zeros), float(rolloff)).to(
+    def _make_module(self, key: ResampleKey, *, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+        return julius.ResampleFrac(int(key.old_sr), int(key.new_sr), int(key.zeros), float(key.rolloff)).to(
             device=device, dtype=dtype
         )
-
-        cache_d[key] = m
-        cache_d.move_to_end(key)
-
-        self._bytes[d] = int(self._bytes.get(d, 0)) + self._module_bytes(m)
-        self._evict_if_needed(d)
-
-        return m
-
 
 def set_filter_cache_max_bytes(device: str, max_bytes: int):
     _FILTER_CACHE.set_max_bytes(device, max_bytes)
@@ -279,10 +228,9 @@ _RESAMPLE_CACHE = ResampleCache()
 
 
 def _quantize_hz(x_hz: torch.Tensor, q_hz: float) -> torch.Tensor:
-    # q_hz <= 0 => no quantization (but that can explode cache)
     q = float(q_hz)
     if q <= 0:
-        return x_hz
+        return x_hz  # If q_hz <= 0, do not quantize (may lead to large cache size)
     return torch.round(x_hz / q) * q
 
 
@@ -296,29 +244,30 @@ def low_pass(
     inplace: bool = True,
 ) -> AudioSignal:
     """
-    Cached Julius low-pass on an AudioSignal. Efficient on GPU.
+    Apply low-pass filtering with cached Julius kernel.
 
-    cutoffs_hz can be float or (B,) tensor/array. Per-item cutoffs supported.
+    Parameters
+    ----------
+    cutoffs_hz : torch.Tensor
+        Shape (n_batch,)
     """
     out = sig if inplace else sig.clone()
-    B = int(out.batch_size)
+    n_batch = int(out.batch_size)
     sr = float(out.sample_rate)
 
-    # Ensure (B,) tensor on device
-    cut = ensure_tensor(cutoffs_hz, 2, B).to(out.device).view(-1).float()
+    cut = ensure_tensor(cutoffs_hz, 2, n_batch).to(out.device).view(-1).float()
     cut = cut.clamp(min=0.0, max=0.5 * sr)
 
-    # Quantize in Hz to keep cache bounded
+    # Quantize in Hz to keep cache small
     cut_q = _quantize_hz(cut, quantize_hz)
 
     # Normalize (0..0.5)
     cut_norm_q = (cut_q / sr).clamp(min=0.0, max=0.5)
 
-    x = out.audio_data  # (B,C,T)
+    x = out.audio_data  # (n_batch, n_channels, n_samples)
     y = torch.empty_like(x)
 
     # Group identical quantized cutoffs to reduce module lookups/calls
-    # Use CPU unique for tiny vectors (B usually small); avoids GPU sync drama.
     uniq = torch.unique(cut_norm_q.detach().cpu())
     for v in uniq.tolist():
         m = _FILTER_CACHE.get(
@@ -349,15 +298,18 @@ def high_pass(
     inplace: bool = True,
 ) -> AudioSignal:
     """
-    Cached Julius high-pass on an AudioSignal. Efficient on GPU.
+    Apply high-pass filtering with cached Julius kernel.
 
-    cutoffs_hz can be float or (B,) tensor/array. Per-item cutoffs supported.
+    Parameters
+    ----------
+    cutoffs_hz : torch.Tensor
+        Shape (n_batch,)
     """
     out = sig if inplace else sig.clone()
-    B = int(out.batch_size)
+    n_batch = int(out.batch_size)
     sr = float(out.sample_rate)
 
-    cut = ensure_tensor(cutoffs_hz, 2, B).to(out.device).view(-1).float()
+    cut = ensure_tensor(cutoffs_hz, 2, n_batch).to(out.device).view(-1).float()
     cut = cut.clamp(min=0.0, max=0.5 * sr)
 
     cut_q = _quantize_hz(cut, quantize_hz)
@@ -399,9 +351,7 @@ def resample_tensor(
     kernel_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """
-    Cached julius resampler. Works on CPU/CUDA depending on x.device.
-
-    x: (..., T) with time last. AudioSignal.audio_data is (B,C,T) so it works.
+    Cached resampling with cached Julius kernel.
     """
     old_sr = int(old_sr)
     new_sr = int(new_sr)
@@ -417,10 +367,8 @@ def resample_tensor(
         device=x.device,
         dtype=kd,
     )
-    # julius accepts (.., T) time-last; output_length/full forwarded
     y = m(x, output_length=output_length, full=full)
 
-    # Ensure output dtype matches input dtype unless caller explicitly wanted kernel dtype
     if y.dtype != x.dtype:
         y = y.to(dtype=x.dtype)
     return y
@@ -439,9 +387,7 @@ def resample(
     kernel_dtype: Optional[torch.dtype] = None,
 ) -> AudioSignal:
     """
-    Resample an AudioSignal using cached julius kernels.
-
-    By default, modifies `sig` in-place (mirrors AudioSignal.resample behavior).
+    Resample signal to target rate.
     """
     new_sr = int(new_sr)
     if int(sig.sample_rate) == new_sr:
