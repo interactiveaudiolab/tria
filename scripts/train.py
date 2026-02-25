@@ -99,13 +99,22 @@ StemDataset = argbind.bind(StemDataset, "train", "val")
 # Rhythm features
 rhythm_features = argbind.bind(rhythm_features)
 
-# Transforms
+# Transforms: allow specification of separate augmentations for rhythm and
+# timbre prompts at both train and validation
 filter_fn = lambda fn: hasattr(fn, "transform") and fn.__qualname__ not in [
+    "NormalizedBaseTransform",
     "BaseTransform",
     "Compose",
     "Choose",
 ]
-tfm = argbind.bind_module(transforms, "train", "val", filter_fn=filter_fn)
+tfm = argbind.bind_module(
+    transforms,
+    "train_rhythm",
+    "train_timbre",
+    "val_rhythm",
+    "val_timbre",
+    filter_fn=filter_fn,
+)
 
 
 def get_infinite_loader(dataloader):
@@ -114,7 +123,7 @@ def get_infinite_loader(dataloader):
             yield batch
 
 
-@argbind.bind("train", "val")
+@argbind.bind("train_rhythm", "train_timbre", "val_rhythm", "val_timbre")
 def build_transform(
     prob: float = 1.0,
     names: list = ["Identity"],
@@ -130,8 +139,10 @@ class State:
     optimizer: AdamW
     scheduler: ExponentialLR
     tokenizer: Tokenizer
-    train_tfm: transforms.Compose
-    val_tfm: transforms.Compose
+    train_rhythm_tfm: transforms.Compose
+    train_timbre_tfm: transforms.Compose
+    val_rhythm_tfm: transforms.Compose
+    val_timbre_tfm: transforms.Compose
     train_data: StemDataset
     val_data: StemDataset
     tracker: Tracker
@@ -185,10 +196,14 @@ def load(
         val_data = StemDataset()
 
     # Load data augmentations
-    with argbind.scope(args, "train"):
-        train_tfm = build_transform()
-    with argbind.scope(args, "val"):
-        val_tfm = build_transform()
+    with argbind.scope(args, "train_rhythm"):
+        train_rhythm_tfm = build_transform()
+    with argbind.scope(args, "train_timbre"):
+        train_timbre_tfm = build_transform()
+    with argbind.scope(args, "val_rhythm"):
+        val_rhythm_tfm = build_transform()
+    with argbind.scope(args, "val_timbre"):
+        val_timbre_tfm = build_transform()
 
     # Load tokenizer
     with argbind.scope(args):
@@ -202,8 +217,10 @@ def load(
         tracker=tracker,
         train_data=train_data,
         val_data=val_data,
-        train_tfm=train_tfm,
-        val_tfm=val_tfm,
+        train_rhythm_tfm=train_rhythm_tfm,
+        train_timbre_tfm=train_timbre_tfm,
+        val_rhythm_tfm=val_rhythm_tfm,
+        val_timbre_tfm=val_timbre_tfm,
     )
 
 
@@ -225,20 +242,32 @@ def val_loop(batch, state, accel):
     idx = batch["idx"]
     seed = format_seed(batch["idx"])
 
-    # Tokenize signal
-    tokens = state.tokenizer.encode(signal).tokens  # (n_batch, n_codebooks, n_frames)
+    # Apply timbre prompt / target augmentation prior to tokenization
+    timbre_prompt = signal.clone()
+    timbre_tfm_kwargs = state.val_timbre_tfm.batch_instantiate(
+        idx.tolist(), timbre_prompt
+    )
+    timbre_prompt = state.val_timbre_tfm.transform(timbre_prompt, **timbre_tfm_kwargs)
+
+    # Tokenize timbre prompt / target
+    tokens = state.tokenizer.encode(
+        timbre_prompt
+    ).tokens  # (n_batch, n_codebooks, n_frames)
     n_batch, n_codebooks, n_frames = tokens.shape
 
     tokens_lengths = (
-        n_frames * signal_lengths.clone().float() / signal.signal_length
+        n_frames * signal_lengths.clone().float() / timbre_prompt.signal_length
     ).long()
 
     # Apply data augmentation prior to rhythm feature extraction
-    tfm_kwargs = state.val_tfm.batch_instantiate(idx.tolist(), signal.clone())
-    signal_aug = state.val_tfm.transform(signal.clone(), **tfm_kwargs)
+    rhythm_prompt = signal.clone()
+    rhythm_tfm_kwargs = state.val_rhythm_tfm.batch_instantiate(
+        idx.tolist(), rhythm_prompt
+    )
+    rhythm_prompt = state.val_rhythm_tfm.transform(rhythm_prompt, **rhythm_tfm_kwargs)
 
     # Extract rhythm features
-    feats = rhythm_features(signal_aug)  # (n_batch, n_feats, n_frames')
+    feats = rhythm_features(rhythm_prompt)  # (n_batch, n_feats, n_frames')
     feats = torch.nn.functional.interpolate(
         feats,
         n_frames,
@@ -253,9 +282,6 @@ def val_loop(batch, state, accel):
     cb = torch.zeros(n_batch, device=accel.device, dtype=torch.long)
     for i, s in enumerate(seed):
         cb[i] = torch.from_numpy(s.randint(0, n_codebooks, (1,))).to(cb)
-
-    # DEBUG
-    # cb[:] = cb[0]
 
     # Sample masks
     span_mask = get_span_mask(
@@ -344,22 +370,36 @@ def train_loop(state, batch, accel):
     seed = format_seed(idx)
 
     with torch.no_grad():
+        # Apply timbre prompt / target augmentation prior to tokenization
+        timbre_prompt = signal.clone()
+        timbre_tfm_kwargs = state.train_timbre_tfm.batch_instantiate(
+            idx.tolist(), timbre_prompt
+        )
+        timbre_prompt = state.train_timbre_tfm.transform(
+            timbre_prompt, **timbre_tfm_kwargs
+        )
+
         # Tokenize signal
         tokens = state.tokenizer.encode(
-            signal
+            timbre_prompt
         ).tokens  # (n_batch, n_codebooks, n_frames)
         n_batch, n_codebooks, n_frames = tokens.shape
 
         tokens_lengths = (
-            n_frames * signal_lengths.clone().float() / signal.signal_length
+            n_frames * signal_lengths.clone().float() / timbre_prompt.signal_length
         ).long()
 
         # Apply data augmentation prior to rhythm feature extraction
-        tfm_kwargs = state.train_tfm.batch_instantiate(idx.tolist(), signal.clone())
-        signal_aug = state.train_tfm.transform(signal.clone(), **tfm_kwargs)
+        rhythm_prompt = signal.clone()
+        rhythm_tfm_kwargs = state.train_rhythm_tfm.batch_instantiate(
+            idx.tolist(), rhythm_prompt
+        )
+        rhythm_prompt = state.train_rhythm_tfm.transform(
+            rhythm_prompt, **rhythm_tfm_kwargs
+        )
 
         # Extract rhythm features
-        feats = rhythm_features(signal_aug)  # (n_batch, n_feats, n_frames')
+        feats = rhythm_features(rhythm_prompt)  # (n_batch, n_feats, n_frames')
         feats = torch.nn.functional.interpolate(
             feats,
             n_frames,
@@ -379,9 +419,6 @@ def train_loop(state, batch, accel):
     cb = torch.zeros(n_batch, device=accel.device, dtype=torch.long)
     for i, s in enumerate(seed):
         cb[i] = torch.from_numpy(s.randint(0, n_codebooks, (1,))).to(cb)
-
-    # DEBUG
-    # cb[:] = cb[0]
 
     # Sample masks
     span_mask = get_span_mask(

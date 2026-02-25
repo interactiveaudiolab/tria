@@ -125,17 +125,23 @@ val/StemDataset.with_replacement: false
 
 tfm_prob: &tfm_prob 0.75
 
-train/build_transform.names: [
+train_rhythm/build_transform.names: [
   "BandPass",
   "ShiftPhase",
   "PitchShift",
   "Equalizer",
   "FilteredNoise",
 ]
-train/build_transform.prob: 1.0
+train_rhythm/build_transform.prob: 1.0
 
-val/build_transform.names: ["Identity"]
-val/build_transform.prob: 1.0
+train_timbre/build_transform.names: ["Identity"]
+train_rhythm/build_transform.prob: 1.0
+
+val_rhythm/build_transform.names: ["Identity"]
+val_rhythm/build_transform.prob: 1.0
+
+val_timbre/build_transform.names: ["Identity"]
+val_timbre/build_transform.prob: 1.0
 
 VolumeNorm.prob: *tfm_prob
 VolumeNorm.db: [uniform, -40, -16]

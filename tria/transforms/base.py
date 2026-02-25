@@ -56,7 +56,7 @@ class NormalizedBaseTransform(BaseTransform):
 
     def transform(self, signal: AudioSignal, **kwargs):
         """
-        Optionally match output energy to input energy, clamp output gain, and 
+        Optionally match output energy to input energy, clamp output gain, and
         ensure output signals do not clip (for transformed batch items only)
         """
         tfm_kwargs = self._prepare(kwargs)
@@ -70,7 +70,9 @@ class NormalizedBaseTransform(BaseTransform):
 
             # Apply transform
             tfm_kwargs_masked = self.apply_mask(tfm_kwargs, mask)
-            tfm_kwargs_masked = {k: v for k, v in tfm_kwargs_masked.items() if k != "mask"}
+            tfm_kwargs_masked = {
+                k: v for k, v in tfm_kwargs_masked.items() if k != "mask"
+            }
             signal[mask] = self._transform(signal[mask], **tfm_kwargs_masked)
 
             # Match energy
@@ -78,13 +80,13 @@ class NormalizedBaseTransform(BaseTransform):
                 x_out = signal[mask].audio_data
                 m_out = _energy(x_out)
 
-                gain = m_in / m_out  # (n_transformed, 1, 1), broadcast to (n_transformed, n_channels, n_samples)
+                gain = torch.sqrt(m_in / m_out.clamp(min=EPS))
 
                 if self.clamp_gain is not None:
                     cg = self.clamp_gain
                     gain = torch.clamp(gain, 1.0 / cg, cg)
 
-                signal[mask].audio_data = x_out * gain
+                signal.audio_data[mask] = signal.audio_data[mask] * gain
 
             # Ensure valid
             if self.ensure_max_of_audio:

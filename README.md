@@ -118,7 +118,7 @@ One you have downloaded your chosen datasets, you can train on a single GPU with
 
 ```
 export CUDA_VISIBLE_DEVICES=0
-python scripts/train.py --args.load conf/small_musdb_moises_fsl_2b.yml
+python scripts/train.py --args.load conf/paper_exp/small_musdb_2b.yml
 ```
 
 ### Multi-GPU Training
@@ -127,7 +127,7 @@ You can train on multiple GPUs (e.g. 2) with:
 
 ```
 export CUDA_VISIBLE_DEVICES=0,1
-torchrun --nproc_per_node gpu scripts/train.py --args.load conf/small_musdb_moises_fsl_2b.yml
+torchrun --nproc_per_node gpu scripts/train.py --args.load conf/paper_exp/small_musdb_2b.yml
 ```
 
 ### Distillation

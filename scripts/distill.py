@@ -103,13 +103,22 @@ StemDataset = argbind.bind(StemDataset, "train", "val")
 # Rhythm features
 rhythm_features = argbind.bind(rhythm_features)
 
-# Transforms
+# Transforms: allow specification of separate augmentations for rhythm and
+# timbre prompts at both train and validation
 filter_fn = lambda fn: hasattr(fn, "transform") and fn.__qualname__ not in [
+    "NormalizedBaseTransform",
     "BaseTransform",
     "Compose",
     "Choose",
 ]
-tfm = argbind.bind_module(transforms, "train", "val", filter_fn=filter_fn)
+tfm = argbind.bind_module(
+    transforms,
+    "train_rhythm",
+    "train_timbre",
+    "val_rhythm",
+    "val_timbre",
+    filter_fn=filter_fn,
+)
 
 
 def get_infinite_loader(dataloader):
@@ -118,7 +127,7 @@ def get_infinite_loader(dataloader):
             yield batch
 
 
-@argbind.bind("train", "val")
+@argbind.bind("train_rhythm", "train_timbre", "val_rhythm", "val_timbre")
 def build_transform(
     prob: float = 1.0,
     names: list = ["Identity"],
@@ -146,11 +155,11 @@ def _distill_kl_loss(
     KL( softmax(t/T) || softmax(s/T) ), averaged over masked positions only.
 
     Shapes:
-      logits: (B, C, F, V)
-      mask:   (B, C, F) boolean
+      logits: (n_batch, n_codebooks, n_frames, n_vocab)
+      mask:   (n_batch, n_codebooks, n_frames) boolean
     """
     # Flatten masked positions for stable reduction
-    # (N, V)
+    # (n_unmasked, n_vocab)
     s = student_logits[mask]
     t = teacher_logits[mask]
 
@@ -176,8 +185,10 @@ class State:
     optimizer: AdamW
     scheduler: ExponentialLR
     tokenizer: Tokenizer
-    train_tfm: transforms.Compose
-    val_tfm: transforms.Compose
+    train_rhythm_tfm: transforms.Compose
+    train_timbre_tfm: transforms.Compose
+    val_rhythm_tfm: transforms.Compose
+    val_timbre_tfm: transforms.Compose
     train_data: StemDataset
     val_data: StemDataset
     tracker: Tracker
@@ -195,15 +206,13 @@ def load(
     teacher_path: str = None,
     teacher_tag: str = "best",
 ):
-    # -------------------------
     # Load teacher (frozen)
-    # -------------------------
     if teacher_path is None:
         raise ValueError(
             "Must provide --teacher_path=<runs_dir> containing <teacher_tag>/model.pt"
         )
 
-    with argbind.scope(args, "teacher"):    
+    with argbind.scope(args, "teacher"):
         teacher, teacher_extras = TRIA(), {}
     tracker.print(teacher)
     print(f"Teacher parameters (total): {count_parameters(teacher)}")
@@ -211,7 +220,9 @@ def load(
     teacher_load_dir = f"{teacher_path}/{teacher_tag}"
     teacher_model_pth = Path(teacher_load_dir) / "model.pt"
 
-    tracker.print(f"Loading teacher from {str(Path('.').absolute())}/{teacher_load_dir}")
+    tracker.print(
+        f"Loading teacher from {str(Path('.').absolute())}/{teacher_load_dir}"
+    )
     if not teacher_model_pth.exists():
         raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_model_pth}")
 
@@ -220,11 +231,8 @@ def load(
     teacher = teacher.to(accel.device)
     teacher = _freeze_(teacher)
 
-    # -------------------------
     # Load / initialize student
-    # -------------------------
-
-    with argbind.scope(args, "student"):        
+    with argbind.scope(args, "student"):
         student, extras = TRIA(), {}
     tracker.print(student)
     print(f"Student trainable parameters: {count_parameters(student)}")
@@ -244,9 +252,7 @@ def load(
 
     student = accel.prepare_model(student)
 
-    # -------------------------
     # Optimizer/scheduler (student only)
-    # -------------------------
     with argbind.scope(args):
         optimizer = AdamW(student.parameters(), use_zero=accel.use_ddp)
         scheduler = ExponentialLR(optimizer)
@@ -258,18 +264,21 @@ def load(
     if "tracker" in extras:
         tracker.load_state_dict(extras["tracker"])
 
-    # -------------------------
     # Data, transforms, tokenizer
-    # -------------------------
     with argbind.scope(args, "train"):
         train_data = StemDataset()
     with argbind.scope(args, "val"):
         val_data = StemDataset()
 
-    with argbind.scope(args, "train"):
-        train_tfm = build_transform()
-    with argbind.scope(args, "val"):
-        val_tfm = build_transform()
+    # Load data augmentations
+    with argbind.scope(args, "train_rhythm"):
+        train_rhythm_tfm = build_transform()
+    with argbind.scope(args, "train_timbre"):
+        train_timbre_tfm = build_transform()
+    with argbind.scope(args, "val_rhythm"):
+        val_rhythm_tfm = build_transform()
+    with argbind.scope(args, "val_timbre"):
+        val_timbre_tfm = build_transform()
 
     with argbind.scope(args):
         tokenizer = Tokenizer().to(accel.device)
@@ -283,8 +292,10 @@ def load(
         tracker=tracker,
         train_data=train_data,
         val_data=val_data,
-        train_tfm=train_tfm,
-        val_tfm=val_tfm,
+        train_rhythm_tfm=train_rhythm_tfm,
+        train_timbre_tfm=train_timbre_tfm,
+        val_rhythm_tfm=val_rhythm_tfm,
+        val_timbre_tfm=val_timbre_tfm,
     )
 
 
@@ -307,24 +318,36 @@ def val_loop(batch, state, accel, distill_temp: float, hard_weight: float):
     idx = batch["idx"]
     seed = format_seed(batch["idx"])
 
-    # Tokenize signal
-    tokens = state.tokenizer.encode(signal).tokens  # (n_batch, n_codebooks, n_frames)
+    # Apply timbre prompt / target augmentation prior to tokenization
+    timbre_prompt = signal.clone()
+    timbre_tfm_kwargs = state.val_timbre_tfm.batch_instantiate(
+        idx.tolist(), timbre_prompt
+    )
+    timbre_prompt = state.val_timbre_tfm.transform(timbre_prompt, **timbre_tfm_kwargs)
+
+    # Tokenize timbre prompt / target
+    tokens = state.tokenizer.encode(
+        timbre_prompt
+    ).tokens  # (n_batch, n_codebooks, n_frames)
     n_batch, n_codebooks, n_frames = tokens.shape
 
     tokens_lengths = (
-        n_frames * signal_lengths.clone().float() / signal.signal_length
+        n_frames * signal_lengths.clone().float() / timbre_prompt.signal_length
     ).long()
 
     # Apply data augmentation prior to rhythm feature extraction
-    tfm_kwargs = state.val_tfm.batch_instantiate(idx.tolist(), signal.clone())
-    signal_aug = state.val_tfm.transform(signal.clone(), **tfm_kwargs)
+    rhythm_prompt = signal.clone()
+    rhythm_tfm_kwargs = state.val_rhythm_tfm.batch_instantiate(
+        idx.tolist(), rhythm_prompt
+    )
+    rhythm_prompt = state.val_rhythm_tfm.transform(rhythm_prompt, **rhythm_tfm_kwargs)
 
     # Extract rhythm features
-    feats = rhythm_features(signal_aug)  # (n_batch, n_feats, n_frames')
+    feats = rhythm_features(rhythm_prompt)  # (n_batch, n_feats, n_frames')
     feats = torch.nn.functional.interpolate(
         feats,
         n_frames,
-        mode=accel.unwrap(state.student).interp,
+        mode=accel.unwrap(state.model).interp,
     )  # (n_batch, n_feats, n_frames)
 
     # Sample timestep, mask proportion, and codebooks
@@ -366,12 +389,12 @@ def val_loop(batch, state, accel, distill_temp: float, hard_weight: float):
         # Teacher logits (frozen)
         teacher_logits = state.teacher(
             tokens, feats, cb, tokens_mask, feats_mask, lengths=tokens_lengths
-        )  # (B, C, F, V)
+        )  # (n_batch, n_codebooks, n_frames, n_vocab)
 
         # Student logits
         student_logits = state.student(
             tokens, feats, cb, tokens_mask, feats_mask, lengths=tokens_lengths
-        )  # (B, C, F, V)
+        )  # (n_batch, n_codebooks, n_frames, n_vocab)
 
         # Distillation KL (already averaged over masked positions inside helper)
         kl = _distill_kl_loss(
@@ -381,11 +404,13 @@ def val_loop(batch, state, accel, distill_temp: float, hard_weight: float):
 
         # Optional hard CE for monitoring (and optionally mixing), normalized over masked positions
         ce_per_pos = torch.nn.functional.cross_entropy(
-            student_logits.permute(0, 3, 1, 2),  # (B, V, C, F)
-            tokens,  # (B, C, F)
+            student_logits.permute(
+                0, 3, 1, 2
+            ),  # (n_batch, n_vocab, n_codebooks, n_frames)
+            tokens,  # (n_batch, n_codebooks, n_frames)
             reduction="none",
             label_smoothing=0.0,
-        )  # (B, C, F)
+        )  # (n_batch, n_codebooks, n_frames)
         ce = (ce_per_pos * loss_mask.float()).sum() / den
         output["loss/hard_cross_entropy"] = ce
 
@@ -393,17 +418,17 @@ def val_loop(batch, state, accel, distill_temp: float, hard_weight: float):
 
     # Log accuracy by codebook (student)
     with torch.no_grad():
-        acc = ((student_logits.argmax(dim=-1) == tokens).float() * loss_mask.float()).sum(
-            dim=(1, 2)
-        ) / loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
+        acc = (
+            (student_logits.argmax(dim=-1) == tokens).float() * loss_mask.float()
+        ).sum(dim=(1, 2)) / loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
 
         # Log CE/acc by selected codebook (cb) for interpretability
         loss_by_cb = {_cb: [] for _cb in cb.tolist()}
         acc_by_cb = {_cb: [] for _cb in cb.tolist()}
 
         # Per-sample masked-normalized CE (so it matches the global normalization style)
-        den_i = loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
-        ce_i = (ce_per_pos * loss_mask.float()).sum(dim=(1, 2)) / den_i  # (B,)
+        den_i = loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (n_batch,)
+        ce_i = (ce_per_pos * loss_mask.float()).sum(dim=(1, 2)) / den_i  # (n_batch,)
 
         for i, _cb in enumerate(cb.tolist()):
             loss_by_cb[_cb] += [ce_i[i].item()]
@@ -442,30 +467,46 @@ def train_loop(state, batch, accel, distill_temp: float, hard_weight: float):
     seed = format_seed(idx)
 
     with torch.no_grad():
+        # Apply timbre prompt / target augmentation prior to tokenization
+        timbre_prompt = signal.clone()
+        timbre_tfm_kwargs = state.train_timbre_tfm.batch_instantiate(
+            idx.tolist(), timbre_prompt
+        )
+        timbre_prompt = state.train_timbre_tfm.transform(
+            timbre_prompt, **timbre_tfm_kwargs
+        )
+
         # Tokenize signal
         tokens = state.tokenizer.encode(
-            signal
+            timbre_prompt
         ).tokens  # (n_batch, n_codebooks, n_frames)
         n_batch, n_codebooks, n_frames = tokens.shape
 
         tokens_lengths = (
-            n_frames * signal_lengths.clone().float() / signal.signal_length
+            n_frames * signal_lengths.clone().float() / timbre_prompt.signal_length
         ).long()
 
         # Apply data augmentation prior to rhythm feature extraction
-        tfm_kwargs = state.train_tfm.batch_instantiate(idx.tolist(), signal.clone())
-        signal_aug = state.train_tfm.transform(signal.clone(), **tfm_kwargs)
+        rhythm_prompt = signal.clone()
+        rhythm_tfm_kwargs = state.train_rhythm_tfm.batch_instantiate(
+            idx.tolist(), rhythm_prompt
+        )
+        rhythm_prompt = state.train_rhythm_tfm.transform(
+            rhythm_prompt, **rhythm_tfm_kwargs
+        )
 
         # Extract rhythm features
-        feats = rhythm_features(signal_aug)  # (n_batch, n_feats, n_frames')
+        feats = rhythm_features(rhythm_prompt)  # (n_batch, n_feats, n_frames')
         feats = torch.nn.functional.interpolate(
             feats,
             n_frames,
-            mode=accel.unwrap(state.student).interp,
+            mode=accel.unwrap(state.model).interp,
         )  # (n_batch, n_feats, n_frames)
 
     # Log padding (invalid) proportion of batch
-    output.update({f"memory/pad_amt": 1 - (tokens_lengths.sum() / (n_batch * n_frames))})
+    output.update(
+        {f"memory/pad_amt": 1 - (tokens_lengths.sum() / (n_batch * n_frames))}
+    )
 
     # Sample timestep, mask proportion, and codebooks
     t = torch.zeros(n_batch, device=accel.device, dtype=torch.float)
@@ -515,11 +556,11 @@ def train_loop(state, batch, accel, distill_temp: float, hard_weight: float):
         with torch.no_grad():
             teacher_logits = state.teacher(
                 tokens, feats, cb, tokens_mask, feats_mask, lengths=tokens_lengths
-            )  # (B, C, F, V)
+            )  # (n_batch, n_codebooks, n_frames, n_vocab)
 
         student_logits = state.student(
             tokens, feats, cb, tokens_mask, feats_mask, lengths=tokens_lengths
-        )  # (B, C, F, V)
+        )  # (n_batch, n_codebooks, n_frames, n_vocab)
 
         # Distillation KL (already averaged over masked positions inside helper)
         kl = _distill_kl_loss(
@@ -529,11 +570,13 @@ def train_loop(state, batch, accel, distill_temp: float, hard_weight: float):
 
         # Optional hard CE (mix-in), normalized over masked positions
         ce_per_pos = torch.nn.functional.cross_entropy(
-            student_logits.permute(0, 3, 1, 2),  # (B, V, C, F)
-            tokens,  # (B, C, F)
+            student_logits.permute(
+                0, 3, 1, 2
+            ),  # (n_batch, n_vocab, n_codebooks, n_frames)
+            tokens,  # (n_batch, n_codebooks, n_frames)
             reduction="none",
             label_smoothing=0.0,
-        )  # (B, C, F)
+        )  # (n_batch, n_codebooks, n_frames)
         ce = (ce_per_pos * loss_mask.float()).sum() / den
         output["loss/hard_cross_entropy"] = ce
 
@@ -549,8 +592,8 @@ def train_loop(state, batch, accel, distill_temp: float, hard_weight: float):
         acc_by_cb = {_cb: [] for _cb in cb.tolist()}
 
         # Per-sample masked-normalized CE (so it matches the global normalization style)
-        den_i = loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
-        ce_i = (ce_per_pos * loss_mask.float()).sum(dim=(1, 2)) / den_i  # (B,)
+        den_i = loss_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (n_batch,)
+        ce_i = (ce_per_pos * loss_mask.float()).sum(dim=(1, 2)) / den_i  # (n_batch,)
 
         for i, _cb in enumerate(cb.tolist()):
             loss_by_cb[_cb] += [ce_i[i].item()]
@@ -672,9 +715,7 @@ def save_samples(
     tokens_mask = prefix_mask[:, None, :].repeat(1, n_codebooks, 1)
     feats_mask = ~prefix_mask
 
-    # -------------------------
     # Batched inference (student)
-    # -------------------------
     student_tokens = tokens.clone()
     generated_student = accel.unwrap(state.student).inference(
         student_tokens,
@@ -701,9 +742,7 @@ def save_samples(
     if state.tracker.step == 0:
         audio_dict["signal"] = signal
 
-        # -------------------------
         # Batched inference (teacher) - only at step 0
-        # -------------------------
         # If teacher has a different interp mode, match it for teacher features.
         feats_teacher = rhythm_features(signal)
         feats_teacher = torch.nn.functional.interpolate(

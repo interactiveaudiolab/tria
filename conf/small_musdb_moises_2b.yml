@@ -119,17 +119,23 @@ val/StemDataset.with_replacement: false
 
 tfm_prob: &tfm_prob 0.75
 
-train/build_transform.names: [
+train_rhythm/build_transform.names: [
   "BandPass",
   "ShiftPhase",
   "PitchShift",
   "Equalizer",
   "FilteredNoise",
 ]
-train/build_transform.prob: 1.0
+train_rhythm/build_transform.prob: 1.0
 
-val/build_transform.names: ["Identity"]
-val/build_transform.prob: 1.0
+train_timbre/build_transform.names: ["Identity"]
+train_rhythm/build_transform.prob: 1.0
+
+val_rhythm/build_transform.names: ["Identity"]
+val_rhythm/build_transform.prob: 1.0
+
+val_timbre/build_transform.names: ["Identity"]
+val_timbre/build_transform.prob: 1.0
 
 VolumeNorm.prob: *tfm_prob
 VolumeNorm.db: [uniform, -40, -16]
@@ -137,7 +143,7 @@ VolumeNorm.db: [uniform, -40, -16]
 BandPass.prob: *tfm_prob
 BandPass.low_cutoff: [choice, [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]]
 BandPass.high_cutoff: [choice, [2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000]]
-BandPass.zeros: 2049  # 51
+BandPass.zeros: 2049
 
 ShiftPhase.prob: *tfm_prob
 

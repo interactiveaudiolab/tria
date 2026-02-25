@@ -41,7 +41,6 @@ LOADED = dict(
     model=None,
     tokenizer=None,
     feature_fn=None,
-    infer_cfg=None,
     sample_rate=None,
     max_duration=None,
 )
@@ -81,15 +80,6 @@ MODEL_ZOO = {
             "clamp_max": 50.0,
             "normalize_quantile": 0.98,
         },
-        "infer_cfg": {
-            "top_p": 0.95,
-            "top_k": None,
-            "temp": 1.0,
-            "mask_temp": 10.5,
-            "iterations": [8, 8, 8, 8, 4, 4, 4, 4, 4],
-            "guidance_scale": 2.0,
-            "causal_bias": 1.0,
-        },
         "max_duration": 6.0,
     },
     "small_musdb_moises_2b": {
@@ -125,15 +115,6 @@ MODEL_ZOO = {
             "clamp_max": 50.0,
             "normalize_quantile": 0.98,
         },
-        "infer_cfg": {
-            "top_p": 0.95,
-            "top_k": None,
-            "temp": 1.0,
-            "mask_temp": 10.5,
-            "iterations": [8, 8, 8, 8, 4, 4, 4, 4, 4],
-            "guidance_scale": 2.0,
-            "causal_bias": 1.0,
-        },
         "max_duration": 6.0,
     },
     "tiny_musdb_moises_fsl_2b": {
@@ -168,15 +149,6 @@ MODEL_ZOO = {
             "legacy_normalize": False,
             "clamp_max": 50.0,
             "normalize_quantile": 0.98,
-        },
-        "infer_cfg": {
-            "top_p": 0.95,
-            "top_k": None,
-            "temp": 1.0,
-            "mask_temp": 10.5,
-            "iterations": [8, 8, 8, 8, 4, 4, 4, 4, 4],
-            "guidance_scale": 2.0,
-            "causal_bias": 1.0,
         },
         "max_duration": 6.0,
     },
@@ -338,7 +310,6 @@ def load_model_by_name(name: str):
             model=model,
             tokenizer=tokenizer,
             feature_fn=feat_fn,
-            infer_cfg=cfg["infer_cfg"],
             sample_rate=tokenizer.sample_rate,
             max_duration=cfg["max_duration"],
         )
