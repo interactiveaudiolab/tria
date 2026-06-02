@@ -60,10 +60,11 @@ class TRIA(torch.nn.Module):
         self.n_registers = n_registers or 0
         if self.n_registers:
             self.registers = torch.nn.Parameter(
-                torch.randn(n_codebooks, self.n_registers, n_channels))
+                torch.randn(n_codebooks, self.n_registers, n_channels)
+            )
         else:
             self.registers = None
-        
+
         self.tokens_emb = torch.nn.Embedding(codebook_size * n_codebooks, n_channels)
         self.head = torch.nn.Linear(
             n_channels, codebook_size * n_codebooks, bias=False
@@ -195,21 +196,23 @@ class TRIA(torch.nn.Module):
 
         # Optionally prepend learnable codebook-specific registers
         if self.n_registers:
-            codebook_mask = torch.arange(n_codebooks, device=device)[None, :] == codebook[:, None]  # (n_batch, n_codebooks)
+            codebook_mask = (
+                torch.arange(n_codebooks, device=device)[None, :] == codebook[:, None]
+            )  # (n_batch, n_codebooks)
 
             registers = self.registers[None, ...] * codebook_mask[:, :, None, None]
             registers = registers.sum(1)  # (n_batch, n_registers, n_channels)
 
             x = torch.cat([registers, x], dim=1)  # (n_batch, n_frames', n_channels)
             lengths = lengths + self.n_registers
-        
+
         # Process with transformer
         x = self.backbone(x=x, lengths_x=lengths)  # (n_batch, n_frames, n_channels)
 
         # Trim registers
         if self.n_registers:
-            x = x[:, self.n_registers:, :]
-        
+            x = x[:, self.n_registers :, :]
+
         # Predict token logits
         logits = self.head(x)  # (n_batch, n_frames, n_codebooks * codebook_size)
         logits = logits.reshape(
@@ -236,6 +239,8 @@ class TRIA(torch.nn.Module):
         guidance_scale: Union[float, Iterable[float]] = None,
         causal_bias: Union[float, Iterable[float]] = None,
         seed: Union[int, Iterable[int]] = None,
+        pseudo_stereo_codebook: Optional[int] = None,
+        vocab_mask: Optional[torch.Tensor] = None,
     ):
         assert not self.training
         device = next(iter(self.parameters())).device
@@ -252,6 +257,15 @@ class TRIA(torch.nn.Module):
 
         assert n_codebooks == self.n_codebooks
         assert n_feats == self.n_feats
+        assert (
+            pseudo_stereo_codebook is None or 0 <= pseudo_stereo_codebook < n_codebooks
+        )
+        if vocab_mask is not None:
+            vocab_mask = vocab_mask.to(device=device, dtype=torch.bool)
+            if vocab_mask.ndim == 2:
+                vocab_mask = vocab_mask.unsqueeze(0).expand(n_batch, -1, -1)
+            assert vocab_mask.shape == (n_batch, n_codebooks, self.codebook_size)
+            assert vocab_mask.any(dim=-1).all()
 
         # Create valid lengths mask
         if lengths is not None:
@@ -360,7 +374,25 @@ class TRIA(torch.nn.Module):
 
             _iterations = max(_iterations or 1, 1)
 
+            if codebook_idx == pseudo_stereo_codebook:
+                tokens = tokens.repeat_interleave(2, dim=0)
+                tokens_mask = tokens_mask.repeat_interleave(2, dim=0)
+                feats = feats.repeat_interleave(2, dim=0)
+                feats_mask = feats_mask.repeat_interleave(2, dim=0)
+                lengths = lengths.repeat_interleave(2, dim=0)
+                n_masked_init = n_masked_init.repeat_interleave(2, dim=0)
+                if vocab_mask is not None:
+                    vocab_mask = vocab_mask.repeat_interleave(2, dim=0)
+                seed = [s + 1000003 * ch for s in seed for ch in range(2)]
+                state[codebook_idx:] = [
+                    format_seed([s + 10007 * cb for s in seed])
+                    for cb in range(codebook_idx, n_codebooks)
+                ]
+                _state = state[codebook_idx]
+
             for _iter in range(_iterations):
+                n_batch = tokens.shape[0]
+
                 # CFG on features by masking
                 if _guidance_scale:
                     tokens_cfg = torch.cat([tokens, tokens], dim=0)
@@ -409,9 +441,12 @@ class TRIA(torch.nn.Module):
                     )  # (n_batch, n_codebooks, n_frames, codebook_size)
 
                 # Truncate logits and sample tokens at masked positions
-                logits = top_p_top_k(
-                    logits[:, codebook_idx : codebook_idx + 1, ...], _top_p, _top_k
-                )  # (n_batch, 1, n_frames, codebook_size)
+                logits = logits[:, codebook_idx : codebook_idx + 1, ...]
+                if vocab_mask is not None:
+                    allowed = vocab_mask[:, codebook_idx, :][:, None, None, :]
+                    logits = logits.masked_fill(~allowed, float("-inf"))
+                logits = top_p_top_k(logits, _top_p, _top_k)
+                # (n_batch, 1, n_frames, codebook_size)
                 sampled, probs = sample(
                     logits,
                     _temp,

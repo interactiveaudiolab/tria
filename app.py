@@ -177,9 +177,14 @@ def bandpass(signal: AudioSignal):
 
 
 def to_gradio_audio(signal: AudioSignal):
+    audio = signal.clone().audio_data[0]
+    if audio.shape[0] == 1:
+        audio = audio.flatten()
+    else:
+        audio = audio.transpose(0, 1)
     return (
         signal.sample_rate,
-        signal.clone().to_mono().audio_data.flatten().numpy().astype(np.float32),
+        audio.numpy().astype(np.float32),
     )
 
 
@@ -463,6 +468,28 @@ def _inference(
     if inference_ctrls["cfg_scale"] in [0.0]:
         inference_ctrls["cfg_scale"] = None
 
+    # Timbre vocabulary restriction
+    vocab_mask = None
+    timbre_vocab_codebooks = min(
+        inference_ctrls["timbre_vocab_codebooks"],
+        model.n_codebooks,
+    )
+    if timbre_vocab_codebooks:
+        vocab_mask = torch.ones(
+            model.n_codebooks,
+            model.codebook_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        vocab_mask[:timbre_vocab_codebooks] = False
+        prefix_tokens = buffer[:, :timbre_vocab_codebooks, :prefix_frames]
+        for codebook_idx in range(timbre_vocab_codebooks):
+            vocab_mask[codebook_idx].scatter_(
+                0,
+                prefix_tokens[:, codebook_idx, :].reshape(-1),
+                True,
+            )
+
     # Inference
     generated = model.inference(
         buffer,
@@ -477,15 +504,37 @@ def _inference(
         guidance_scale=inference_ctrls["cfg_scale"],
         causal_bias=inference_ctrls["causal_bias"],
         seed=seed,
+        pseudo_stereo_codebook=inference_ctrls["pseudo_stereo_codebook"],
+        vocab_mask=vocab_mask,
     )[..., prefix_frames:]
 
     # Write result
-    assert generated.shape == rhythm_tokens.tokens.shape
-    rhythm_tokens.tokens = generated
+    stereo = inference_ctrls["pseudo_stereo_codebook"] is not None
+    if stereo:
+        assert generated.shape == (
+            2 * rhythm_tokens.tokens.shape[0],
+            *rhythm_tokens.tokens.shape[1:],
+        )
+    else:
+        assert generated.shape == rhythm_tokens.tokens.shape
+    generated_tokens = TokenSequence(
+        tokens=generated,
+        extras=dict(rhythm_tokens.extras),
+    )
+    if stereo:
+        generated_tokens.extras["n_channels"] = 2
 
     # Decode to audio
-    out = tokenizer.decode(rhythm_tokens)
-    out.normalize(audio_ctrls["loudness_db"])
+    out = tokenizer.decode(generated_tokens)
+    if stereo:
+        x = out.audio_data
+        mid = x.mean(dim=1, keepdim=True)
+        side = x - mid
+        x = mid + inference_ctrls["pseudo_stereo_width"] * side
+        rms = torch.sqrt((x * x).mean(dim=(1, 2), keepdim=True) + 1e-12)
+        out.audio_data = x * (db_to_linear(audio_ctrls["loudness_db"]) / rms)
+    else:
+        out.normalize(audio_ctrls["loudness_db"])
     out.ensure_max_of_audio()
 
     # Echo parameters
@@ -498,7 +547,10 @@ def _inference(
         f"mask_temp={sampling_ctrls['mask_temperature']}; "
         f"seed={int(seed[0])}, "
         f"causal_bias={inference_ctrls['causal_bias']}, "
-        f"cfg={inference_ctrls['cfg_scale']}"
+        f"cfg={inference_ctrls['cfg_scale']}, "
+        f"timbre_vocab_codebooks={inference_ctrls['timbre_vocab_codebooks']}, "
+        f"pseudo_stereo_codebook={inference_ctrls['pseudo_stereo_codebook']}, "
+        f"pseudo_stereo_width={inference_ctrls['pseudo_stereo_width']}"
     )
     return out, msg
 
@@ -547,6 +599,9 @@ def on_generate(
     seed,
     causal_bias,
     cfg_scale,
+    timbre_vocab_codebooks,
+    pseudo_stereo_variation,
+    pseudo_stereo_width,
     loudness_db,
     filter_inputs,
     *schedule_vals,
@@ -562,7 +617,21 @@ def on_generate(
         temperature=float(temperature),
         mask_temperature=float(mask_temperature),
     )
-    inference_ctrls = dict(causal_bias=float(causal_bias), cfg_scale=float(cfg_scale))
+    pseudo_stereo_variation = int(pseudo_stereo_variation)
+    pseudo_stereo_width = float(pseudo_stereo_width)
+    pseudo_stereo_codebook = (
+        pseudo_stereo_variation
+        if pseudo_stereo_variation < LOADED["tokenizer"].n_codebooks
+        and pseudo_stereo_width > 0.0
+        else None
+    )
+    inference_ctrls = dict(
+        causal_bias=float(causal_bias),
+        cfg_scale=float(cfg_scale),
+        pseudo_stereo_codebook=pseudo_stereo_codebook,
+        pseudo_stereo_width=pseudo_stereo_width,
+        timbre_vocab_codebooks=int(timbre_vocab_codebooks),
+    )
     audio_ctrls = dict(
         loudness_db=float(loudness_db), filter_inputs=bool(filter_inputs)
     )
@@ -696,6 +765,9 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                     cfg_scale = gr.Slider(
                         0.0, 10.0, value=2.0, step=0.1, label="CFG Scale"
                     )
+                timbre_vocab_codebooks = gr.Slider(
+                    0, 9, value=9, step=1, label="Timbre Vocabulary Codebooks"
+                )
 
             with gr.Accordion("Audio", open=False):
                 with gr.Row():
@@ -703,6 +775,15 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                         -80.0, 0.0, value=-20.0, step=0.5, label="Loudness (dB)"
                     )
                     filter_inputs = gr.Checkbox(value=False, label="Filter Inputs")
+
+            with gr.Accordion("Stereo", open=False):
+                with gr.Row():
+                    pseudo_stereo_variation = gr.Slider(
+                        0, 9, value=5, step=1, label="Pseudo Stereo Variation"
+                    )
+                    pseudo_stereo_width = gr.Slider(
+                        0.0, 2.0, value=1.0, step=0.05, label="Pseudo Stereo Width"
+                    )
 
         with gr.Column():
             with gr.Accordion("Schedule", open=False):
@@ -764,6 +845,9 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
             seed,
             causal_bias,
             cfg_scale,
+            timbre_vocab_codebooks,
+            pseudo_stereo_variation,
+            pseudo_stereo_width,
             loudness_db,
             filter_inputs,
             *schedule_sliders,
