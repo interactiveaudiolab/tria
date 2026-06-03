@@ -35,9 +35,6 @@ Launch the [Gradio](https://www.gradio.app/) interface:
 python app.py
 ```
 
-<span style="color:red">More models and configurations coming soon!</span>
-
-
 ## Training
 
 ### Download Datasets
