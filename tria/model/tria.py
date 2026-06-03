@@ -241,6 +241,7 @@ class TRIA(torch.nn.Module):
         seed: Union[int, Iterable[int]] = None,
         pseudo_stereo_codebook: Optional[int] = None,
         vocab_mask: Optional[torch.Tensor] = None,
+        loop_pad_frames: int = 0,
     ):
         assert not self.training
         device = next(iter(self.parameters())).device
@@ -302,6 +303,35 @@ class TRIA(torch.nn.Module):
 
         # Mark corresponding feature sequence positions as masked to exclude from inference
         feats_mask = feats_mask * valid.to(feats_mask.dtype)
+        loop_pad_frames = int(loop_pad_frames or 0)
+        loop_sample_mask = None
+        loop_spans = None
+        if loop_pad_frames:
+            loop_sample_mask = feats_mask.bool()
+            loop_spans = []
+            for b in range(n_batch):
+                idx = torch.where(loop_sample_mask[b])[0]
+                assert idx.numel() > 2 * loop_pad_frames
+                loop_sample_mask[b, idx[:loop_pad_frames]] = False
+                loop_sample_mask[b, idx[-loop_pad_frames:]] = False
+                loop_spans.append(
+                    (
+                        idx[:loop_pad_frames],
+                        idx[loop_pad_frames:-loop_pad_frames],
+                        idx[-loop_pad_frames:],
+                    )
+                )
+
+        def _sync_loop_padding():
+            if loop_spans is None:
+                return
+            for b, (left, main, right) in enumerate(loop_spans):
+                src_left = main[-loop_pad_frames:]
+                src_right = main[:loop_pad_frames]
+                tokens[b, :, left] = tokens[b, :, src_left]
+                tokens_mask[b, :, left] = tokens_mask[b, :, src_left]
+                tokens[b, :, right] = tokens[b, :, src_right]
+                tokens_mask[b, :, right] = tokens_mask[b, :, src_right]
 
         # Account for per-codebook args
         def _to_codebooks(v):
@@ -339,7 +369,13 @@ class TRIA(torch.nn.Module):
         causal_bias = _to_codebooks(causal_bias)
 
         # Track initial masked token counts
-        n_masked_init = (~tokens_mask).long().sum(dim=-1)  # (n_batch, n_codebooks)
+        if loop_sample_mask is not None:
+            n_masked_init = (
+                (~tokens_mask & loop_sample_mask[:, None, :]).long().sum(dim=-1)
+            )
+        else:
+            n_masked_init = (~tokens_mask).long().sum(dim=-1)
+        # (n_batch, n_codebooks)
 
         # Generate one codebook at a time
         for codebook_idx, (
@@ -383,6 +419,9 @@ class TRIA(torch.nn.Module):
                 n_masked_init = n_masked_init.repeat_interleave(2, dim=0)
                 if vocab_mask is not None:
                     vocab_mask = vocab_mask.repeat_interleave(2, dim=0)
+                if loop_sample_mask is not None:
+                    loop_sample_mask = loop_sample_mask.repeat_interleave(2, dim=0)
+                    loop_spans = [span for span in loop_spans for _ in range(2)]
                 seed = [s + 1000003 * ch for s in seed for ch in range(2)]
                 state[codebook_idx:] = [
                     format_seed([s + 10007 * cb for s in seed])
@@ -392,6 +431,7 @@ class TRIA(torch.nn.Module):
 
             for _iter in range(_iterations):
                 n_batch = tokens.shape[0]
+                _sync_loop_padding()
 
                 # CFG on features by masking
                 if _guidance_scale:
@@ -453,6 +493,8 @@ class TRIA(torch.nn.Module):
                     argmax=(_iter == _iterations - 1),
                 )  # (n_batch, 1, n_frames) x2
                 write_idx = ~(tokens_mask[:, codebook_idx, :])  # (n_batch, n_frames)
+                if loop_sample_mask is not None:
+                    write_idx = write_idx & loop_sample_mask
                 tokens[:, codebook_idx, :][write_idx] = sampled[:, 0, :][write_idx]
 
                 # Compute implied generation timestep and corresponding target mask
@@ -494,5 +536,6 @@ class TRIA(torch.nn.Module):
                 # Re-apply span and codebook masks
                 tokens_mask = ~torch.logical_and(~tokens_mask, feats_mask.unsqueeze(1))
                 tokens_mask[:, :codebook_idx, :] = True
+                _sync_loop_padding()
 
         return tokens

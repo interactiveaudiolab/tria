@@ -397,6 +397,75 @@ def _prepare_inputs(
     )
 
 
+def _prepare_loopable_inputs(
+    timbre_prompt: AudioSignal,
+    rhythm_prompt: AudioSignal,
+    prefix_dur: float,
+    buffer_dur: float,
+    sample_rate: int,
+    feat_fn: Callable,
+    tokenizer: Tokenizer,
+    interp: str,
+    device: str,
+    loop_pad_frames: int,
+):
+    timbre_prompt = resample(timbre_prompt.clone(), sample_rate)
+    rhythm_prompt = resample(rhythm_prompt.clone(), sample_rate)
+
+    timbre_prompt = _to_channels(timbre_prompt, tokenizer.n_channels)
+    rhythm_prompt = _to_channels(rhythm_prompt, tokenizer.n_channels)
+
+    timbre_prompt = timbre_prompt.truncate_samples(int(prefix_dur * sample_rate))
+    max_rhythm_samples = int(buffer_dur * sample_rate) - timbre_prompt.signal_length
+    max_rhythm_samples -= 2 * int(loop_pad_frames) * tokenizer.hop_length
+    rhythm_prompt = rhythm_prompt.truncate_samples(max(max_rhythm_samples, 0))
+
+    timbre_tokens = tokenizer.encode(timbre_prompt)
+    rhythm_tokens = tokenizer.encode(rhythm_prompt)
+    n_batch, n_codebooks, n_rhythm_frames = rhythm_tokens.tokens.shape
+    prefix_frames = timbre_tokens.tokens.shape[-1]
+    loop_pad_frames = min(int(loop_pad_frames), n_rhythm_frames)
+
+    left = rhythm_tokens.tokens[..., -loop_pad_frames:]
+    right = rhythm_tokens.tokens[..., :loop_pad_frames]
+    tokens = torch.cat(
+        [timbre_tokens.tokens, left, rhythm_tokens.tokens, right], dim=-1
+    )
+    n_frames = tokens.shape[-1]
+
+    _feats = feat_fn(rhythm_prompt)
+    _feats = torch.nn.functional.interpolate(_feats, n_rhythm_frames, mode=interp)
+    feats = torch.zeros(n_batch, _feats.shape[1], n_frames, device=device)
+    feats[..., prefix_frames : prefix_frames + loop_pad_frames] = _feats[
+        ...,
+        -loop_pad_frames:,
+    ]
+    feats[
+        ...,
+        prefix_frames
+        + loop_pad_frames : prefix_frames
+        + loop_pad_frames
+        + n_rhythm_frames,
+    ] = _feats
+    feats[..., -loop_pad_frames:] = _feats[..., :loop_pad_frames]
+
+    tokens_mask = torch.zeros_like(tokens, dtype=torch.bool)
+    tokens_mask[..., :prefix_frames] = True
+    feats_mask = torch.zeros(n_batch, n_frames, dtype=torch.bool, device=device)
+    feats_mask[:, prefix_frames:] = True
+
+    return (
+        tokens,
+        feats,
+        tokens_mask,
+        feats_mask,
+        timbre_tokens,
+        rhythm_tokens,
+        prefix_frames,
+        loop_pad_frames,
+    )
+
+
 def _timbre_vocab_mask(tokens, prefix_frames, n_codebooks, codebook_size, n_restrict):
     n_restrict = min(int(n_restrict), n_codebooks)
     if not n_restrict:
@@ -478,6 +547,10 @@ def _inference_windowed(
     )
 
     stereo = inference_ctrls["pseudo_stereo_codebook"] is not None
+    loop_pad_frames = (
+        int(inference_ctrls["loop_pad_frames"]) if inference_ctrls["loopable"] else 0
+    )
+    first_head = None
     context = None
     out_audio = None
     pos = 0
@@ -487,13 +560,22 @@ def _inference_windowed(
     while pos < n_rhythm_frames:
         ctx_frames = 0 if context is None else min(overlap_frames, context.shape[-1])
         ctx_tokens = None if ctx_frames == 0 else context[..., -ctx_frames:]
+        suffix_tokens = None
+        suffix_frames = 0
         new_capacity = max_rhythm_frames - ctx_frames
+        if loop_pad_frames and first_head is not None:
+            suffix_frames = min(loop_pad_frames, first_head.shape[-1])
+            if n_rhythm_frames - pos <= new_capacity - suffix_frames:
+                suffix_tokens = first_head[..., :suffix_frames]
+                new_capacity -= suffix_frames
+            else:
+                suffix_frames = 0
         new_frames = min(new_capacity, n_rhythm_frames - pos)
         if new_frames <= 0:
             break
 
-        total_frames = prefix_frames + ctx_frames + new_capacity
-        valid_frames = prefix_frames + ctx_frames + new_frames
+        total_frames = prefix_frames + ctx_frames + new_capacity + suffix_frames
+        valid_frames = prefix_frames + ctx_frames + new_frames + suffix_frames
 
         tokens = torch.zeros(
             n_batch,
@@ -509,9 +591,29 @@ def _inference_windowed(
             ...,
             prefix_frames + ctx_frames : prefix_frames + ctx_frames + new_frames,
         ] = rhythm_tokens.tokens[..., pos : pos + new_frames]
+        if suffix_tokens is not None:
+            tokens[
+                ...,
+                prefix_frames
+                + ctx_frames
+                + new_frames : prefix_frames
+                + ctx_frames
+                + new_frames
+                + suffix_frames,
+            ] = suffix_tokens
 
         tokens_mask = torch.zeros_like(tokens, dtype=torch.bool)
         tokens_mask[..., : prefix_frames + ctx_frames] = True
+        if suffix_tokens is not None:
+            tokens_mask[
+                ...,
+                prefix_frames
+                + ctx_frames
+                + new_frames : prefix_frames
+                + ctx_frames
+                + new_frames
+                + suffix_frames,
+            ] = True
         tokens_mask[..., valid_frames:] = True
 
         feats = torch.zeros(n_batch, feats_full.shape[1], total_frames, device=device)
@@ -562,19 +664,24 @@ def _inference_windowed(
             if context is None
             else torch.cat([context, new_context], dim=-1)
         )
+        if first_head is None and loop_pad_frames:
+            first_head = context[..., :loop_pad_frames]
 
         decode_tokens = generated[
             ...,
-            prefix_frames : prefix_frames + ctx_frames + new_frames,
+            prefix_frames : prefix_frames + ctx_frames + new_frames + suffix_frames,
         ]
         remaining_samples = rhythm_prompt.signal_length - samples_written
         new_samples = min(new_frames * tokenizer.hop_length, remaining_samples)
         overlap_samples = ctx_frames * tokenizer.hop_length
+        suffix_samples = suffix_frames * tokenizer.hop_length
         token_seq = TokenSequence(
             tokens=decode_tokens,
             extras=dict(rhythm_tokens.extras),
         )
-        token_seq.extras["signal_length"] = overlap_samples + new_samples
+        token_seq.extras["signal_length"] = (
+            overlap_samples + new_samples + suffix_samples
+        )
         if stereo:
             token_seq.extras["n_channels"] = 2
 
@@ -616,6 +723,8 @@ def _inference_windowed(
         f"causal_bias={inference_ctrls['causal_bias']}, "
         f"cfg={inference_ctrls['cfg_scale']}, "
         f"timbre_vocab_codebooks={inference_ctrls['timbre_vocab_codebooks']}, "
+        f"loopable={inference_ctrls['loopable']}, "
+        f"loop_pad_frames={inference_ctrls['loop_pad_frames']}, "
         f"pseudo_stereo_codebook={inference_ctrls['pseudo_stereo_codebook']}, "
         f"pseudo_stereo_width={inference_ctrls['pseudo_stereo_width']}"
     )
@@ -674,6 +783,10 @@ def _inference(
         inference_ctrls["cfg_scale"] = None
 
     max_rhythm_dur = buffer_dur - min(prefix_dur, timbre_prompt.duration)
+    loop_pad_frames = (
+        int(inference_ctrls["loop_pad_frames"]) if inference_ctrls["loopable"] else 0
+    )
+    max_rhythm_dur -= 2 * loop_pad_frames * tokenizer.hop_length / sample_rate
     if rhythm_prompt.duration > max_rhythm_dur:
         return _inference_windowed(
             timbre_prompt,
@@ -687,25 +800,48 @@ def _inference(
             device,
         )
 
-    (
-        buffer,
-        feats,
-        buffer_mask,
-        feats_mask,
-        timbre_tokens,
-        rhythm_tokens,
-        prefix_frames,
-    ) = _prepare_inputs(
-        timbre_prompt,
-        rhythm_prompt,
-        prefix_dur,
-        buffer_dur,
-        sample_rate,
-        feat_fn,
-        tokenizer,
-        interp,
-        device,
-    )
+    if loop_pad_frames:
+        (
+            buffer,
+            feats,
+            buffer_mask,
+            feats_mask,
+            timbre_tokens,
+            rhythm_tokens,
+            prefix_frames,
+            loop_pad_frames,
+        ) = _prepare_loopable_inputs(
+            timbre_prompt,
+            rhythm_prompt,
+            prefix_dur,
+            buffer_dur,
+            sample_rate,
+            feat_fn,
+            tokenizer,
+            interp,
+            device,
+            loop_pad_frames,
+        )
+    else:
+        (
+            buffer,
+            feats,
+            buffer_mask,
+            feats_mask,
+            timbre_tokens,
+            rhythm_tokens,
+            prefix_frames,
+        ) = _prepare_inputs(
+            timbre_prompt,
+            rhythm_prompt,
+            prefix_dur,
+            buffer_dur,
+            sample_rate,
+            feat_fn,
+            tokenizer,
+            interp,
+            device,
+        )
 
     vocab_mask = _timbre_vocab_mask(
         buffer,
@@ -731,26 +867,51 @@ def _inference(
         seed=seed,
         pseudo_stereo_codebook=inference_ctrls["pseudo_stereo_codebook"],
         vocab_mask=vocab_mask,
-    )[..., prefix_frames:]
+        loop_pad_frames=loop_pad_frames,
+    )
+    if loop_pad_frames:
+        generated = generated[
+            ...,
+            prefix_frames : prefix_frames
+            + loop_pad_frames
+            + rhythm_tokens.tokens.shape[-1]
+            + loop_pad_frames,
+        ]
+    else:
+        generated = generated[..., prefix_frames:]
 
     # Write result
     stereo = inference_ctrls["pseudo_stereo_codebook"] is not None
     if stereo:
+        expected_batch = 2 * rhythm_tokens.tokens.shape[0]
+    else:
+        expected_batch = rhythm_tokens.tokens.shape[0]
+    if loop_pad_frames:
         assert generated.shape == (
-            2 * rhythm_tokens.tokens.shape[0],
-            *rhythm_tokens.tokens.shape[1:],
+            expected_batch,
+            *rhythm_tokens.tokens.shape[1:-1],
+            rhythm_tokens.tokens.shape[-1] + 2 * loop_pad_frames,
         )
     else:
-        assert generated.shape == rhythm_tokens.tokens.shape
+        assert generated.shape == (expected_batch, *rhythm_tokens.tokens.shape[1:])
     generated_tokens = TokenSequence(
         tokens=generated,
         extras=dict(rhythm_tokens.extras),
     )
+    if loop_pad_frames:
+        generated_tokens.extras["signal_length"] = (
+            rhythm_tokens.extras["signal_length"]
+            + 2 * loop_pad_frames * tokenizer.hop_length
+        )
     if stereo:
         generated_tokens.extras["n_channels"] = 2
 
     # Decode to audio
     out = tokenizer.decode(generated_tokens)
+    if loop_pad_frames:
+        start = loop_pad_frames * tokenizer.hop_length
+        stop = start + rhythm_tokens.extras["signal_length"]
+        out.audio_data = out.audio_data[..., start:stop]
     if stereo:
         x = out.audio_data
         mid = x.mean(dim=1, keepdim=True)
@@ -774,6 +935,8 @@ def _inference(
         f"causal_bias={inference_ctrls['causal_bias']}, "
         f"cfg={inference_ctrls['cfg_scale']}, "
         f"timbre_vocab_codebooks={inference_ctrls['timbre_vocab_codebooks']}, "
+        f"loopable={inference_ctrls['loopable']}, "
+        f"loop_pad_frames={loop_pad_frames}, "
         f"pseudo_stereo_codebook={inference_ctrls['pseudo_stereo_codebook']}, "
         f"pseudo_stereo_width={inference_ctrls['pseudo_stereo_width']}"
     )
@@ -830,6 +993,8 @@ def on_generate(
     loudness_db,
     filter_inputs,
     window_overlap_frames,
+    loopable,
+    loop_pad_frames,
     *schedule_vals,
 ):
     # Ensure model up-to-date
@@ -858,6 +1023,8 @@ def on_generate(
         pseudo_stereo_width=pseudo_stereo_width,
         timbre_vocab_codebooks=int(timbre_vocab_codebooks),
         window_overlap_frames=int(window_overlap_frames),
+        loopable=bool(loopable),
+        loop_pad_frames=int(loop_pad_frames),
     )
     audio_ctrls = dict(
         loudness_db=float(loudness_db), filter_inputs=bool(filter_inputs)
@@ -993,7 +1160,7 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                         0.0, 10.0, value=2.0, step=0.1, label="CFG Scale"
                     )
                 timbre_vocab_codebooks = gr.Slider(
-                    0, 9, value=9, step=1, label="Timbre Vocabulary Codebooks"
+                    0, 9, value=9, step=1, label="Restrict Codebooks"
                 )
 
             with gr.Accordion("Audio", open=False):
@@ -1006,7 +1173,12 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                         0, 64, value=10, step=1, label="Window Overlap Frames"
                     )
 
-            with gr.Accordion("Stereo", open=False):
+                with gr.Row():
+                    loopable = gr.Checkbox(value=False, label="Loopable")
+                    loop_pad_frames = gr.Slider(
+                        0, 64, value=10, step=1, label="Loop Padding Frames"
+                    )
+
                 with gr.Row():
                     pseudo_stereo_variation = gr.Slider(
                         0, 9, value=5, step=1, label="Pseudo Stereo Variation"
@@ -1081,6 +1253,8 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
             loudness_db,
             filter_inputs,
             window_overlap_frames,
+            loopable,
+            loop_pad_frames,
             *schedule_sliders,
         ],
         outputs=[
