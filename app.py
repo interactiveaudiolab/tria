@@ -244,7 +244,45 @@ def _to_rgb_uint8(img2d: np.ndarray):
     return np.repeat(img2d[:, :, None], 3, axis=2)
 
 
-def spectrogram_fast(signal: AudioSignal, small: bool = False):
+def _mask_to_width(mask, target_w: int):
+    if mask is None:
+        return None
+    mask = np.asarray(mask, dtype=np.float32).reshape(1, -1)
+    if mask.shape[1] == 0:
+        return None
+    return _resize_width_linear_uint8((255 * mask).astype(np.uint8), target_w)[0] > 0
+
+
+def _overlay_columns(img, mask, color, alpha=0.28):
+    mask = _mask_to_width(mask, img.shape[1])
+    if mask is None or not mask.any():
+        return img
+    color = np.asarray(color, dtype=np.float32).reshape(1, 1, 3)
+    out = img.astype(np.float32)
+    out[:, mask] = out[:, mask] * (1.0 - alpha) + color * alpha
+    return out.clip(0, 255).astype(np.uint8)
+
+
+def _feature_image(signal: AudioSignal, target_w: int, feature_h: int):
+    feat_fn = LOADED["feature_fn"]
+    if feat_fn is None:
+        cfg = MODEL_ZOO[next(iter(MODEL_ZOO))]["feature_cfg"]
+        feat_fn = partial(rhythm_features, **cfg)
+    signal = signal.clone().to_mono()
+    with torch.no_grad():
+        feats = feat_fn(signal).cpu()[0].numpy()
+    img = np.repeat((255.0 * feats).clip(0, 255).astype(np.uint8), feature_h, axis=0)
+    img = np.flipud(img)
+    img = _resize_width_linear_uint8(img, target_w=target_w)
+    return _to_rgb_uint8(img)
+
+
+def spectrogram_fast(
+    signal: AudioSignal,
+    small: bool = False,
+    timbre_retrieval_mask=None,
+    rhythm_retrieval_mask=None,
+):
     """
     Fast log-mel spectrogram.
     """
@@ -253,8 +291,14 @@ def spectrogram_fast(signal: AudioSignal, small: bool = False):
     signal = signal.clone().to_mono()
     y = signal.audio_data.flatten().numpy()
 
+    feature_h = 8 if small else 10
+    gap_h = 5 if small else 6
     if y.size == 0:
-        return np.zeros((SPEC_MELS, target_w, 3), dtype=np.uint8)
+        n_feats = LOADED["model"].n_feats if LOADED["model"] is not None else 2
+        return np.zeros(
+            (SPEC_MELS + gap_h + feature_h * n_feats, target_w, 3),
+            dtype=np.uint8,
+        )
 
     n_fft = 512 if small else 1024
     hop = 128 if small else 256
@@ -273,9 +317,14 @@ def spectrogram_fast(signal: AudioSignal, small: bool = False):
     img = (255.0 * (S_db + 80.0) / 80.0).astype(np.uint8)  # (n_mels, n_frames)
     img = np.flipud(img)
 
-    img = _strip_silent_borders_uint8(img, thr=2)
     img = _resize_width_linear_uint8(img, target_w=target_w)
-    return _to_rgb_uint8(img)
+    spec = _to_rgb_uint8(img)
+    spec = _overlay_columns(spec, timbre_retrieval_mask, color=(245, 135, 48))
+
+    feats = _feature_image(signal, target_w, feature_h)
+    feats = _overlay_columns(feats, rhythm_retrieval_mask, color=(204, 71, 120))
+    gap = np.zeros((gap_h, target_w, 3), dtype=np.uint8)
+    return np.concatenate([spec, gap, feats], axis=0)
 
 
 ########################################
@@ -369,6 +418,10 @@ def _prepare_inputs(
     prefix_frames = timbre_tokens.tokens.shape[-1]
 
     # Extract features
+    timbre_feats = feat_fn(timbre_prompt)
+    timbre_feats = torch.nn.functional.interpolate(
+        timbre_feats, prefix_frames, mode=interp
+    )
     _feats = feat_fn(rhythm_prompt)
     _feats = torch.nn.functional.interpolate(
         _feats, n_frames - prefix_frames, mode=interp
@@ -392,6 +445,7 @@ def _prepare_inputs(
         tokens_mask,
         feats_mask,
         timbre_tokens,
+        timbre_feats,
         rhythm_tokens,
         prefix_frames,
     )
@@ -433,6 +487,10 @@ def _prepare_loopable_inputs(
     )
     n_frames = tokens.shape[-1]
 
+    timbre_feats = feat_fn(timbre_prompt)
+    timbre_feats = torch.nn.functional.interpolate(
+        timbre_feats, prefix_frames, mode=interp
+    )
     _feats = feat_fn(rhythm_prompt)
     _feats = torch.nn.functional.interpolate(_feats, n_rhythm_frames, mode=interp)
     feats = torch.zeros(n_batch, _feats.shape[1], n_frames, device=device)
@@ -460,6 +518,7 @@ def _prepare_loopable_inputs(
         tokens_mask,
         feats_mask,
         timbre_tokens,
+        timbre_feats,
         rhythm_tokens,
         prefix_frames,
         loop_pad_frames,
@@ -486,6 +545,114 @@ def _timbre_vocab_mask(tokens, prefix_frames, n_codebooks, codebook_size, n_rest
             True,
         )
     return vocab_mask
+
+
+def _retrieval_windows(feats, window, stride=1):
+    window = min(max(int(window), 1), feats.shape[-1])
+    stride = max(int(stride), 1)
+    x = feats.float().unfold(-1, window, stride)
+    return x.permute(0, 2, 1, 3).flatten(2)
+
+
+def _aligned_retrieval_windows(feats, window, align):
+    window = min(max(int(window), 1), feats.shape[-1])
+    if align == "start":
+        left, right = 0, window - 1
+    else:
+        left = window // 2
+        right = window - 1 - left
+    mode = "reflect" if feats.shape[-1] > 1 else "replicate"
+    x = torch.nn.functional.pad(feats.float(), (left, right), mode=mode)
+    x = x.unfold(-1, window, 1)
+    return x.permute(0, 2, 1, 3).flatten(2)
+
+
+def _apply_retrieval(
+    tokens,
+    tokens_mask,
+    timbre_tokens,
+    timbre_feats,
+    rhythm_feats,
+    target_start,
+    target_frames,
+    ctrls,
+):
+    use_timbre = bool(ctrls["timbre_retrieval"])
+    use_rhythm = bool(ctrls["rhythm_retrieval"])
+    n_codebooks = min(int(ctrls["retrieval_codebooks"]), tokens.shape[1])
+    timbre_mask = torch.zeros(tokens.shape[0], target_frames, dtype=torch.bool)
+    rhythm_mask = torch.zeros(tokens.shape[0], target_frames, dtype=torch.bool)
+    if not (use_timbre or use_rhythm):
+        return timbre_mask, rhythm_mask
+    if target_frames <= 0 or timbre_tokens.shape[-1] <= 0:
+        return timbre_mask, rhythm_mask
+    if use_timbre and n_codebooks <= 0:
+        return timbre_mask, rhythm_mask
+
+    method = ctrls["retrieval_method"]
+    window = min(int(ctrls["retrieval_window"]), target_frames, timbre_tokens.shape[-1])
+    if window <= 0:
+        return timbre_mask, rhythm_mask
+
+    match_threshold = float(ctrls["retrieval_match_threshold"])
+    activity_threshold = float(ctrls["retrieval_activity_threshold"])
+    query_feats = rhythm_feats[..., :target_frames]
+    key_feats = timbre_feats
+
+    if method == "indep":
+        q = _aligned_retrieval_windows(query_feats, window, ctrls["retrieval_align"])
+        k = _aligned_retrieval_windows(key_feats, window, ctrls["retrieval_align"])
+        activity = q.mean(dim=-1)
+        q_starts = torch.arange(target_frames, device=tokens.device)
+        span_frames = 1
+    else:
+        query_stride = window if method == "disjoint" else 1
+        q = _retrieval_windows(query_feats, window, query_stride)
+        k = _retrieval_windows(key_feats, window, 1)
+        activity = q.mean(dim=-1)
+        q_starts = torch.arange(
+            0,
+            target_frames - window + 1,
+            query_stride,
+            device=tokens.device,
+        )
+        span_frames = window
+
+    q = torch.nn.functional.normalize(q, dim=-1)
+    k = torch.nn.functional.normalize(k, dim=-1)
+    scores, key_idx = torch.bmm(q, k.transpose(1, 2)).max(dim=-1)
+    scores = (scores + 1.0) / 2.0
+    keep = (scores >= match_threshold) & (activity >= activity_threshold)
+
+    for b in range(tokens.shape[0]):
+        selected = torch.where(keep[b])[0]
+        if method == "greedy":
+            occupied = torch.zeros(
+                target_frames, dtype=torch.bool, device=tokens.device
+            )
+            selected = selected[scores[b, selected].argsort(descending=True)]
+        for i in selected.tolist():
+            q0 = int(q_starts[i])
+            if method == "greedy":
+                q1 = q0 + span_frames
+                if occupied[q0:q1].any():
+                    continue
+                occupied[q0:q1] = True
+            k0 = int(key_idx[b, i])
+            n = min(span_frames, target_frames - q0, timbre_tokens.shape[-1] - k0)
+            if n <= 0:
+                continue
+            if use_rhythm:
+                rhythm_feats[b, :, q0 : q0 + n] = timbre_feats[b, :, k0 : k0 + n]
+                rhythm_mask[b, q0 : q0 + n] = True
+            if use_timbre:
+                sl = slice(target_start + q0, target_start + q0 + n)
+                tokens[b, :n_codebooks, sl] = timbre_tokens[
+                    b, :n_codebooks, k0 : k0 + n
+                ]
+                tokens_mask[b, :n_codebooks, sl] = True
+                timbre_mask[b, q0 : q0 + n] = True
+    return timbre_mask, rhythm_mask
 
 
 def _crossfade(a: torch.Tensor, b: torch.Tensor, n: int):
@@ -525,6 +692,12 @@ def _inference_windowed(
 
     timbre_prompt = timbre_prompt.truncate_samples(int(prefix_dur * sample_rate))
     timbre_tokens = tokenizer.encode(timbre_prompt)
+    timbre_feats = feat_fn(timbre_prompt)
+    timbre_feats = torch.nn.functional.interpolate(
+        timbre_feats,
+        timbre_tokens.tokens.shape[-1],
+        mode=interp,
+    )
     rhythm_tokens = tokenizer.encode(rhythm_prompt)
 
     n_batch, n_codebooks, n_rhythm_frames = rhythm_tokens.tokens.shape
@@ -553,6 +726,8 @@ def _inference_windowed(
     first_head = None
     context = None
     out_audio = None
+    timbre_retrieval_masks = []
+    rhythm_retrieval_masks = []
     pos = 0
     samples_written = 0
     n_windows = 0
@@ -624,6 +799,22 @@ def _inference_windowed(
 
         feats_mask = torch.zeros(n_batch, total_frames, dtype=torch.bool, device=device)
         feats_mask[:, prefix_frames + ctx_frames : valid_frames] = True
+
+        timbre_mask, rhythm_mask = _apply_retrieval(
+            tokens,
+            tokens_mask,
+            timbre_tokens.tokens,
+            timbre_feats,
+            feats[
+                ...,
+                prefix_frames + ctx_frames : prefix_frames + ctx_frames + new_frames,
+            ],
+            prefix_frames + ctx_frames,
+            new_frames,
+            inference_ctrls,
+        )
+        timbre_retrieval_masks.append(timbre_mask)
+        rhythm_retrieval_masks.append(rhythm_mask)
 
         vocab_mask = _timbre_vocab_mask(
             tokens,
@@ -699,6 +890,8 @@ def _inference_windowed(
     out = AudioSignal(out_audio, sample_rate=sample_rate)
     out.truncate_samples(rhythm_prompt.signal_length)
     out.zero_pad_to(rhythm_prompt.signal_length)
+    out.timbre_retrieval_mask = torch.cat(timbre_retrieval_masks, dim=-1)
+    out.rhythm_retrieval_mask = torch.cat(rhythm_retrieval_masks, dim=-1)
 
     if stereo:
         x = out.audio_data
@@ -723,6 +916,13 @@ def _inference_windowed(
         f"causal_bias={inference_ctrls['causal_bias']}, "
         f"cfg={inference_ctrls['cfg_scale']}, "
         f"timbre_vocab_codebooks={inference_ctrls['timbre_vocab_codebooks']}, "
+        f"rhythm_retrieval={inference_ctrls['rhythm_retrieval']}, "
+        f"timbre_retrieval={inference_ctrls['timbre_retrieval']}, "
+        f"retrieval={inference_ctrls['retrieval_method']}/"
+        f"{inference_ctrls['retrieval_codebooks']}cb, "
+        f"retrieval_window={inference_ctrls['retrieval_window']}, "
+        f"retrieval_match={inference_ctrls['retrieval_match_threshold']}, "
+        f"retrieval_activity={inference_ctrls['retrieval_activity_threshold']}, "
         f"loopable={inference_ctrls['loopable']}, "
         f"loop_pad_frames={inference_ctrls['loop_pad_frames']}, "
         f"pseudo_stereo_codebook={inference_ctrls['pseudo_stereo_codebook']}, "
@@ -807,6 +1007,7 @@ def _inference(
             buffer_mask,
             feats_mask,
             timbre_tokens,
+            timbre_feats,
             rhythm_tokens,
             prefix_frames,
             loop_pad_frames,
@@ -829,6 +1030,7 @@ def _inference(
             buffer_mask,
             feats_mask,
             timbre_tokens,
+            timbre_feats,
             rhythm_tokens,
             prefix_frames,
         ) = _prepare_inputs(
@@ -842,6 +1044,26 @@ def _inference(
             interp,
             device,
         )
+
+    target_start = prefix_frames + loop_pad_frames if loop_pad_frames else prefix_frames
+    timbre_retrieval_mask, rhythm_retrieval_mask = _apply_retrieval(
+        buffer,
+        buffer_mask,
+        timbre_tokens.tokens,
+        timbre_feats,
+        feats[..., target_start : target_start + rhythm_tokens.tokens.shape[-1]],
+        target_start,
+        rhythm_tokens.tokens.shape[-1],
+        inference_ctrls,
+    )
+    if loop_pad_frames and inference_ctrls["rhythm_retrieval"]:
+        n = rhythm_tokens.tokens.shape[-1]
+        feats[..., prefix_frames : prefix_frames + loop_pad_frames] = feats[
+            ..., target_start + n - loop_pad_frames : target_start + n
+        ]
+        feats[..., target_start + n : target_start + n + loop_pad_frames] = feats[
+            ..., target_start : target_start + loop_pad_frames
+        ]
 
     vocab_mask = _timbre_vocab_mask(
         buffer,
@@ -922,6 +1144,8 @@ def _inference(
     else:
         out.normalize(audio_ctrls["loudness_db"])
     out.ensure_max_of_audio()
+    out.timbre_retrieval_mask = timbre_retrieval_mask
+    out.rhythm_retrieval_mask = rhythm_retrieval_mask
 
     # Echo parameters
     msg = (
@@ -935,6 +1159,13 @@ def _inference(
         f"causal_bias={inference_ctrls['causal_bias']}, "
         f"cfg={inference_ctrls['cfg_scale']}, "
         f"timbre_vocab_codebooks={inference_ctrls['timbre_vocab_codebooks']}, "
+        f"rhythm_retrieval={inference_ctrls['rhythm_retrieval']}, "
+        f"timbre_retrieval={inference_ctrls['timbre_retrieval']}, "
+        f"retrieval={inference_ctrls['retrieval_method']}/"
+        f"{inference_ctrls['retrieval_codebooks']}cb, "
+        f"retrieval_window={inference_ctrls['retrieval_window']}, "
+        f"retrieval_match={inference_ctrls['retrieval_match_threshold']}, "
+        f"retrieval_activity={inference_ctrls['retrieval_activity_threshold']}, "
         f"loopable={inference_ctrls['loopable']}, "
         f"loop_pad_frames={loop_pad_frames}, "
         f"pseudo_stereo_codebook={inference_ctrls['pseudo_stereo_codebook']}, "
@@ -988,6 +1219,14 @@ def on_generate(
     causal_bias,
     cfg_scale,
     timbre_vocab_codebooks,
+    rhythm_retrieval,
+    timbre_retrieval,
+    retrieval_method,
+    retrieval_codebooks,
+    retrieval_window,
+    retrieval_align,
+    retrieval_match_threshold,
+    retrieval_activity_threshold,
     pseudo_stereo_variation,
     pseudo_stereo_width,
     loudness_db,
@@ -1022,6 +1261,14 @@ def on_generate(
         pseudo_stereo_codebook=pseudo_stereo_codebook,
         pseudo_stereo_width=pseudo_stereo_width,
         timbre_vocab_codebooks=int(timbre_vocab_codebooks),
+        rhythm_retrieval=bool(rhythm_retrieval),
+        timbre_retrieval=bool(timbre_retrieval),
+        retrieval_method=str(retrieval_method),
+        retrieval_codebooks=int(retrieval_codebooks),
+        retrieval_window=int(retrieval_window),
+        retrieval_align=str(retrieval_align),
+        retrieval_match_threshold=float(retrieval_match_threshold),
+        retrieval_activity_threshold=float(retrieval_activity_threshold),
         window_overlap_frames=int(window_overlap_frames),
         loopable=bool(loopable),
         loop_pad_frames=int(loop_pad_frames),
@@ -1052,10 +1299,24 @@ def on_generate(
         schedule_ctrls,
         seed,
     )
+    timbre_retrieval_mask = getattr(out, "timbre_retrieval_mask", None)
+    rhythm_retrieval_mask = getattr(out, "rhythm_retrieval_mask", None)
     out = out.cpu()
 
     out_audio = [to_gradio_audio(out[i]) for i in range(N_OUTPUTS)]
-    out_specs = [spectrogram_fast(out[i], small=False) for i in range(N_OUTPUTS)]
+    out_specs = [
+        spectrogram_fast(
+            out[i],
+            small=False,
+            timbre_retrieval_mask=None
+            if timbre_retrieval_mask is None
+            else timbre_retrieval_mask[i],
+            rhythm_retrieval_mask=None
+            if rhythm_retrieval_mask is None
+            else rhythm_retrieval_mask[i],
+        )
+        for i in range(N_OUTPUTS)
+    ]
 
     return out_audio + out_specs + [msg]
 
@@ -1163,6 +1424,37 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                     0, 9, value=9, step=1, label="Restrict Codebooks"
                 )
 
+            with gr.Accordion("Retrieval", open=False):
+                with gr.Row():
+                    rhythm_retrieval = gr.Checkbox(
+                        value=False, label="Rhythm Retrieval"
+                    )
+                    timbre_retrieval = gr.Checkbox(
+                        value=False, label="Timbre Retrieval"
+                    )
+                with gr.Row():
+                    retrieval_method = gr.Dropdown(
+                        ["indep", "disjoint", "greedy"],
+                        value="greedy",
+                        label="Retrieval Method",
+                    )
+                    retrieval_codebooks = gr.Slider(
+                        0, 9, value=5, step=1, label="Retrieval Codebooks"
+                    )
+                    retrieval_window = gr.Slider(
+                        1, 128, value=15, step=1, label="Retrieval Window"
+                    )
+                with gr.Row():
+                    retrieval_align = gr.Dropdown(
+                        ["center", "start"], value="center", label="Retrieval Align"
+                    )
+                    retrieval_match_threshold = gr.Slider(
+                        0.0, 1.0, value=0.9, step=0.01, label="Match Threshold"
+                    )
+                    retrieval_activity_threshold = gr.Slider(
+                        0.0, 1.0, value=0.25, step=0.01, label="Activity Threshold"
+                    )
+
             with gr.Accordion("Audio", open=False):
                 with gr.Row():
                     loudness_db = gr.Slider(
@@ -1248,6 +1540,14 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
             causal_bias,
             cfg_scale,
             timbre_vocab_codebooks,
+            rhythm_retrieval,
+            timbre_retrieval,
+            retrieval_method,
+            retrieval_codebooks,
+            retrieval_window,
+            retrieval_align,
+            retrieval_match_threshold,
+            retrieval_activity_threshold,
             pseudo_stereo_variation,
             pseudo_stereo_width,
             loudness_db,
